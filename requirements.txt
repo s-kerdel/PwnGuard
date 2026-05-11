@@ -1,0 +1,4 @@
+pyyaml>=6.0
+
+# Optional: only needed for claude-api backend
+# anthropic>=0.40.0

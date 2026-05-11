@@ -1,0 +1,33 @@
+# Secrets / local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*
+.netrc
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Tool output
+audit-report.*
+*.log

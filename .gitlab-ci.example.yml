@@ -1,0 +1,44 @@
+# .gitlab-ci.yml (add this stage to your existing pipeline)
+#
+# Option A: Ollama on self-hosted runner (no API key needed)
+# Option B: Claude API (requires ANTHROPIC_API_KEY CI/CD variable)
+#
+# For MR comments, set GITLAB_TOKEN (personal access token, api scope)
+# in Settings > CI/CD > Variables (masked, protected)
+
+stages:
+  # ... your existing stages ...
+  - security
+
+# --- Option A: Self-hosted runner with Ollama (recommended) ---
+pwnguard:
+  stage: security
+  tags:
+    - security-runner  # your self-hosted runner tag
+  rules:
+    - if: $CI_MERGE_REQUEST_IID
+  before_script:
+    - pip install pyyaml --quiet
+    # Ensure Ollama is running on the runner
+    - ollama list || echo "Warning: Ollama not available"
+  script:
+    - python pwnguard/audit.py --mode ci --mr-diff --backend ollama
+  allow_failure: false
+
+# --- Option B: Claude API (if org has API access) ---
+# pwnguard:
+#   stage: security
+#   image: python:3.12-slim
+#   rules:
+#     - if: $CI_MERGE_REQUEST_IID
+#   variables:
+#     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+#   cache:
+#     key: pwnguard-pip
+#     paths:
+#       - .pip-cache/
+#   before_script:
+#     - pip install anthropic pyyaml --quiet
+#   script:
+#     - python pwnguard/audit.py --mode ci --mr-diff --backend claude-api
+#   allow_failure: false

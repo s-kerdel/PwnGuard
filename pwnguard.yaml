@@ -1,0 +1,52 @@
+# pwnguard.yaml
+# PwnGuard configuration: AI-powered security audit
+
+# Minimum severity to block commits/merges
+# Options: CRITICAL, HIGH, MEDIUM, LOW, INFO
+severity_threshold: HIGH
+
+# Claude Code CLI settings (local, uses Pro subscription)
+# Default backend for local development
+claude_code:
+  timeout: 120  # seconds
+
+# Claude API settings (requires ANTHROPIC_API_KEY)
+# Only needed if your org has API access
+claude_api:
+  model: claude-sonnet-4-20250514
+  max_tokens: 4096
+
+# Ollama settings (local LLM, free, offline)
+# Default backend for CI (self-hosted runner)
+ollama:
+  model: qwen2.5-coder:7b
+  url: http://localhost:11434
+
+# File patterns to skip (glob syntax)
+ignore_patterns:
+  - "*.min.js"
+  - "*.min.css"
+  - "*.lock"
+  - "*.map"
+  - "vendor/*"
+  - "node_modules/*"
+  - "*.test.php"
+  - "*.spec.js"
+  - "*.spec.ts"
+  - "migrations/*"
+  - "tests/*"
+  - "Test/*"
+
+# Only scan these file extensions (empty = scan all)
+language_focus:
+  - php
+  - js
+  - ts
+  - twig
+  - html
+
+# Maximum diff size (lines) before truncation
+max_diff_lines: 500
+
+# Maximum single file size (KB) to include
+max_file_size_kb: 100

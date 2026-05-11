@@ -1,0 +1,57 @@
+#!/bin/sh
+#
+# PwnGuard - AI-powered security pre-commit hook
+# Installed automatically via composer install
+#
+# Backends (auto-detected):
+#   1. Claude Code (if installed, uses Pro subscription)
+#   2. Ollama (if running locally)
+#
+# Override: pwnguard/hooks/pre-commit --backend ollama
+# Skip:     git commit --no-verify
+#
+
+# Find project root
+PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$PROJECT_ROOT" ]; then
+    echo "Error: not inside a git repository"
+    exit 1
+fi
+
+AUDIT_SCRIPT="$PROJECT_ROOT/pwnguard/audit.py"
+
+if [ ! -f "$AUDIT_SCRIPT" ]; then
+    echo "Warning: pwnguard/audit.py not found, skipping security check"
+    exit 0
+fi
+
+# Check Python is available
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+    PYTHON=python
+else
+    echo "Warning: Python not found, skipping PwnGuard"
+    exit 0
+fi
+
+# Check pyyaml is installed
+$PYTHON -c "import yaml" 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "Installing pyyaml..."
+    $PYTHON -m pip install pyyaml --quiet --break-system-packages 2>/dev/null || \
+    $PYTHON -m pip install pyyaml --quiet 2>/dev/null
+fi
+
+# Run the audit
+$PYTHON "$AUDIT_SCRIPT" --mode hook "$@"
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -eq 1 ]; then
+    echo ""
+    echo "Commit blocked by PwnGuard."
+    echo "Fix the findings above, or skip with: git commit --no-verify"
+    echo ""
+fi
+
+exit $EXIT_CODE
