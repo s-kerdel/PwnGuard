@@ -4,6 +4,8 @@
 .pwnguard.env
 !.env.example
 !.pwnguard.env.example
+pwnguard.local.yaml
+.pwnguard.local.yaml
 *.pem
 *.key
 credentials*

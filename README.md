@@ -1,6 +1,6 @@
 # PwnGuard
 
-> **Status: Proof of Concept (`v0.1.0`).**
+> **Status: Proof of Concept (`v0.1.1`).**
 > PwnGuard is published as a reference / portfolio piece. It works
 > end-to-end, but the config schema, prompt format, and CLI flags may
 > change without notice before a `1.0` release. Don't rely on it as
@@ -65,10 +65,12 @@ elsewhere. Other languages / frameworks will land as configurable
 | `claude-code` | Claude Pro subscription | Included in Pro | Local default; broad context, high recall |
 | `ollama` | None | Free | CI/CD, offline, small machines |
 | `claude-api` | `ANTHROPIC_API_KEY` | Pay per token | Orgs with API access; CI without runner |
+| `openai-compat` | `OPENAI_API_KEY` | Depends on provider | Any OpenAI-compatible endpoint: LiteLLM, vLLM, OpenRouter, Groq, Together, Fireworks, llama.cpp server, LM Studio, etc. |
 
 Auto-detection: locally the tool checks for the `claude` CLI first and
 falls back to Ollama. In CI it uses Ollama by default; if
-`ANTHROPIC_API_KEY` is set, it uses claude-api.
+`ANTHROPIC_API_KEY` is set, it uses claude-api. The `openai-compat`
+backend is always opt-in via `--backend openai-compat`.
 
 ## Setup
 
@@ -110,7 +112,7 @@ The pre-commit hook is now installed. Every developer who runs
 
 - Python 3.7+ (Python 2 is **not** supported; EOL since 2020)
 - `pyyaml==6.0.2` (install with `pip install --user pyyaml`)
-- One of: Claude Code CLI, an Ollama server, or `ANTHROPIC_API_KEY`
+- One of: Claude Code CLI, an Ollama server, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` (for any OpenAI-compatible endpoint)
 
 ## How it works
 
@@ -186,8 +188,11 @@ python3 pwnguard/audit.py --from-url "<URL>" --review
 ### Watch what the model is doing in real time
 ```bash
 python3 pwnguard/audit.py --backend ollama --files src/Foo.php --debug
-# Streams the model's output token-by-token to stderr
-# and prints per-request stats at the end.
+# Or against any OpenAI-compatible endpoint (LiteLLM, vLLM, etc.):
+python3 pwnguard/audit.py --backend openai-compat --files src/Foo.php --debug
+# Shows a "Waiting for response / Model is thinking" spinner during
+# prompt processing, then streams tokens to stderr as they arrive,
+# then prints per-request stats (tokens, t/s, stop reason).
 ```
 
 ### Save findings to a Markdown report
@@ -221,7 +226,7 @@ Every flag accepted by `audit.py`. Default values come from
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--backend {claude-code,ollama,claude-api}` | auto-detected | Which AI backend to use. Auto-detection picks claude-code if the `claude` CLI is present, otherwise ollama. |
+| `--backend {claude-code,ollama,claude-api,openai-compat}` | auto-detected | Which AI backend to use. Auto-detection picks claude-code if the `claude` CLI is present, otherwise ollama. `openai-compat` is opt-in. |
 | `--model <NAME>` | from config | Override the model for the active backend (e.g. `qwen2.5-coder:14b`, `claude-opus-4-7`, `claude-sonnet-4-6`). |
 | `--config <PATH>` | `pwnguard.yaml` in cwd | Use a different config file. |
 
@@ -234,7 +239,7 @@ Every flag accepted by `audit.py`. Default values come from
 | `--no-color` | off | Disable ANSI color and OSC 8 hyperlinks. Also auto-disabled when stdout is not a TTY or when `NO_COLOR` is set. |
 | `--code-preview {auto,on,off}` | `auto` | Show the affected-code block + `Example:` fix snippet. `auto` = on for claude backends, off for ollama (smaller models give imprecise line numbers and skip fix examples). |
 | `--report <PATH>` | (none) | Write the findings as a Markdown report to `<PATH>`. |
-| `--debug` | off | Stream the model's output live to stderr instead of showing the spinner. Prints per-request stats (token count, tokens-per-second, stop reason). Useful when scans return empty or stop unexpectedly. |
+| `--debug` | off | Stream the model's output live to stderr (ollama + openai-compat backends). During prompt processing a "Waiting for response..." / "Model is thinking..." spinner shows that the server is active; once tokens start arriving the spinner exits and the stream takes over. Prints per-request stats at the end (token count, tokens-per-second, stop reason). Useful when scans return empty or stop unexpectedly. |
 
 ### Decision flow
 
@@ -308,6 +313,46 @@ Every config key, its default, and what it controls. PwnGuard looks for
 | `temperature` | (model default) | Lower = more deterministic. PwnGuard's shipped config uses `0.5` for exploration. |
 | `seed` | (random) | Pin the RNG for fully reproducible runs. Comment out for variation. |
 
+### `openai:` (uses any OpenAI-compatible Chat Completions endpoint)
+
+Works against LiteLLM, vLLM, OpenRouter, Groq, Together, Fireworks,
+llama.cpp server, LM Studio, Ollama's `/v1` mode, etc. Activate with
+`--backend openai-compat`.
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `url` | `https://api.openai.com` | Base URL. `/v1/chat/completions` is appended automatically. |
+| `model` | `gpt-4o-mini` | Model name as the upstream endpoint expects it. |
+| `api_key_env` | `OPENAI_API_KEY` | Name of the env var to read the Bearer token from. The key never lives in the yaml. |
+| `allow_insecure` | `false` | Allow plaintext HTTP to non-loopback hosts. Default blocks it so the Bearer token + diff can't be intercepted on the wire. Loopback (localhost / 127.0.0.1 / ::1) is always allowed regardless. |
+| `timeout` | `600` | Wall-clock seconds per request. Raise for very large diffs or slow proxies. |
+| `num_predict` | (server default) | Max output tokens (maps to OpenAI's `max_tokens`). |
+| `temperature` | (server default) | Lower = more deterministic. |
+| `seed` | (server default) | Pin the RNG for reproducible runs (only honored by some providers). |
+| `top_p` | (server default) | Nucleus-sampling cutoff. |
+
+Security guards: the URL scheme is restricted to `http` / `https` (no
+`file://` / `ftp://`); HTTP redirects are refused so the Bearer token
+can never be forwarded across hosts; the destination host is printed
+on every run so a stealth yaml edit is visible.
+
+### Local override (`pwnguard.local.yaml`)
+
+PwnGuard also auto-loads a gitignored `pwnguard.local.yaml` (or
+`.pwnguard.local.yaml`) and deep-merges it on top of the main config.
+Use it for machine-specific values that shouldn't land in the
+committed config:
+
+```yaml
+# pwnguard.local.yaml  (gitignored)
+openai:
+  url: https://litellm.internal.example.com
+  model: qwen3-coder-480b
+```
+
+Both file names are in the shipped `.gitignore`. The same pattern
+works for any config key, not just `openai:`.
+
 ## Environment variables
 
 PwnGuard auto-loads `.pwnguard.env` and `.env` from the current directory
@@ -317,6 +362,7 @@ Process env always wins over what's loaded from a file.
 | Var | Required when | Purpose |
 |-----|---------------|---------|
 | `ANTHROPIC_API_KEY` | using `--backend claude-api` | Anthropic API token. |
+| `OPENAI_API_KEY` (or the var named by `openai.api_key_env`) | using `--backend openai-compat` | Bearer token sent to the OpenAI-compatible endpoint. Required - PwnGuard never reads it from the yaml. |
 | `GITLAB_TOKEN` (or `PWNGUARD_GITLAB_TOKEN`) | using `--from-url` against a GitLab URL | Personal Access Token with `api` or `read_api` scope. |
 | `GITHUB_TOKEN` (or `PWNGUARD_GITHUB_TOKEN`) | private GitHub repos + rate-limit lift | GitHub PAT or fine-grained token. Optional for public repos. |
 | `PWNGUARD_SKIP` | one-off | If set to `1`, the pre-commit hook exits 0 immediately. Bypasses just PwnGuard, leaves other hooks running. |
@@ -375,8 +421,14 @@ Useful for archiving scans or attaching to issues.
 
 ### `--debug`
 
-Stream-style. Live model output to stderr while the scan runs (Ollama
-backend only). At the end, per-request stats:
+Stream-style. Live model output to stderr while the scan runs.
+Supported on the `ollama` and `openai-compat` backends. Three phases:
+
+1. **Waiting for response** - spinner with elapsed seconds (request in flight, server hasn't replied yet).
+2. **Model responding / Model is thinking** - spinner label flips once any chunk arrives; "thinking" specifically when a reasoning model (DeepSeek R1, Qwen-thinking, etc.) is emitting `reasoning_content` before its actual answer.
+3. **Live token stream** - spinner exits, tokens echo to stderr as they're generated.
+
+Per-request stats print at the end:
 
 ```
 PwnGuard: prompt: 6,142 tokens  ·  output: 423 tokens  ·  84.2 t/s  ·  stop: stop
@@ -549,9 +601,14 @@ hard gate.
 - Cross-file context is reduced in chunked mode; cross-hunk context is
   reduced when a single file is sub-split.
 - Ollama (especially 7B) is less accurate than Claude for security
-  review, and may give imprecise line numbers. `--code-preview auto`
-  hides the affected-code block for ollama so wrong line markers
-  don't mislead you.
+  review. `--code-preview auto` hides the affected-code block on the
+  ollama backend so missing-fix-example fields don't leave empty
+  cards. Line numbers drift on every backend we've tried (including
+  mid-sized OpenAI-compat models and occasionally Claude), so the
+  red `-` target marker in the affected-code block is currently
+  suppressed globally; the ±3-line context window still renders so
+  you see the area, just without a misleading "this exact row"
+  pointer.
 - Reproducibility on Ollama depends on `seed` + `temperature`; without
   pinning the seed, the same diff can produce different findings
   across runs.

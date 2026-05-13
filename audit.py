@@ -16,9 +16,12 @@ Output / interaction:
     --report PATH   Write findings to a markdown file at PATH.
 
 Backends:
-    --backend claude-code  (local, uses Claude Code CLI from Pro subscription)
-    --backend ollama       (local, requires running Ollama instance)
-    --backend claude-api   (requires ANTHROPIC_API_KEY, for orgs with API access)
+    --backend claude-code    (local, uses Claude Code CLI from Pro subscription)
+    --backend ollama         (local, requires running Ollama instance)
+    --backend claude-api     (requires ANTHROPIC_API_KEY, for orgs with API access)
+    --backend openai-compat  (any OpenAI-compatible endpoint: LiteLLM, vLLM,
+                              OpenRouter, Groq, llama.cpp, etc.;
+                              requires OPENAI_API_KEY)
 
 Configuration:
     See pwnguard.yaml for severity thresholds, model settings, and ignore patterns.
@@ -33,6 +36,7 @@ import socket
 import subprocess
 import sys
 import textwrap
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -43,7 +47,7 @@ from typing import Optional
 # Local sibling module; works because Python prepends script dir to sys.path.
 import ui
 
-__version__ = "0.1.0"  # PoC; bump when behaviour or config schema changes.
+__version__ = "0.1.1"  # PoC; bump when behaviour or config schema changes.
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -79,6 +83,23 @@ DEFAULT_CONFIG = {
         #   num_predict: 2048  - cap output length
         #   temperature: 0.2   - lower = more consistent
     },
+    "openai": {
+        # Any OpenAI-compatible Chat Completions endpoint: LiteLLM proxy,
+        # vLLM, OpenRouter, Groq, Together, Fireworks, llama.cpp server,
+        # LM Studio, Ollama's /v1 mode, etc. `/v1/chat/completions` is
+        # appended to `url`, so set the base (no trailing path).
+        "url": "https://api.openai.com",
+        "model": "gpt-4o-mini",
+        "timeout": 600,
+        # API key is read from the OPENAI_API_KEY env var (never the yaml,
+        # so the repo stays committable). Override the env var name here
+        # if your project uses a different one (e.g. for multiple proxies).
+        "api_key_env": "OPENAI_API_KEY",
+        # Optional tunables (omit any to use the server's default):
+        #   num_predict: 4096  - max output tokens
+        #   temperature: 0.2   - lower = more consistent
+        #   seed: 42           - pin RNG for reproducible runs
+    },
     "ignore_patterns": [
         "*.min.js",
         "*.min.css",
@@ -98,6 +119,12 @@ DEFAULT_CONFIG = {
 # Prevents an attacker-controlled pwnguard.yaml from redirecting diffs to a
 # remote endpoint (SSRF / data exfiltration).
 SAFE_OLLAMA_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+# Loopback hosts where plaintext HTTP is acceptable for the openai-compat
+# backend. Traffic never leaves the host, so the Bearer token can't be
+# intercepted on the wire. Any non-loopback HTTP target requires the user
+# to set openai.allow_insecure: true (acknowledging the plaintext risk).
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 # Wrapper tags around untrusted diff content in the prompt. The system prompt
 # instructs the model to treat anything inside as data, not instructions, so
@@ -123,16 +150,21 @@ _claude_code_available: Optional[bool] = None
 # Overridden in main() by --code-preview.
 _show_code_preview = True
 
+# Red `-` marker on the AI-reported "target" row in the affected-code
+# block. Disabled: line numbers drift across backends; flip back when fixed.
+_highlight_target_line = False
+
 # Whether to request Ollama's structured JSON output mode. On gives
 # valid JSON guaranteed but roughly doubles generation time on 7B
 # models because the constraint engine has to validate every token.
 # Off is faster but relies on the model staying in schema voluntarily.
 _ollama_json_mode = True
 
-# Debug mode: when enabled, the Ollama backend uses streaming so the
-# model's output appears on stderr as it's generated. The spinner is
-# replaced by the live token stream - useful to see whether the model
-# is actually producing findings, is stuck, or stopped mid-token.
+# Debug mode: when enabled, the Ollama and openai-compat backends use
+# streaming so the model's output appears on stderr as it's generated.
+# The spinner is replaced by the live token stream - useful to see
+# whether the model is actually producing findings, is stuck, or
+# stopped mid-token. (Claude Code / Claude API run as single calls.)
 _debug_mode = False
 
 
@@ -255,6 +287,21 @@ def load_config(config_path: Optional[str] = None) -> dict:
             ui.dim("PwnGuard: no pwnguard.yaml found; using built-in defaults."),
             file=sys.stderr,
         )
+
+    # Local, gitignored override. Lets a developer set machine-specific
+    # values (e.g. their own openai.url + model) without leaking into the
+    # committed pwnguard.yaml. Deep-merges on top, so it can override any
+    # subset of keys.
+    for local_path in ("pwnguard.local.yaml", ".pwnguard.local.yaml"):
+        if os.path.exists(local_path):
+            with open(local_path) as f:
+                local_config = yaml.safe_load(f) or {}
+            deep_merge(config, local_config)
+            print(
+                ui.dim(f"PwnGuard: merged local overrides from {local_path}"),
+                file=sys.stderr,
+            )
+            break
 
     return config
 
@@ -1269,10 +1316,18 @@ def _query_ollama_stream(req: urllib.request.Request, timeout: int, url: str) ->
     full accumulated content string after the stream is done so the
     rest of the pipeline (parse_response, etc.) can treat it the same
     as a non-streamed response.
+
+    Shows a "waiting for first token" spinner during prompt processing
+    so the user sees something is happening (large diffs on local 7B
+    models can sit silent for many seconds while Ollama tokenises and
+    runs prompt eval before any output token is emitted).
     """
-    print(ui.dim("--- begin model output ---"), file=sys.stderr)
     full_content = ""
     final_meta: dict = {}
+    waiting = ui.Spinner("Waiting for response (ollama)")
+    waiting.__enter__()
+    first_token_seen = False
+    any_chunk_seen = False
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             for raw_line in resp:
@@ -1283,8 +1338,18 @@ def _query_ollama_stream(req: urllib.request.Request, timeout: int, url: str) ->
                     chunk = json.loads(line.decode())
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
+                # First sign of life from Ollama: prompt eval is running.
+                # Update the label so the user sees activity rather than
+                # a static "waiting" message while the server processes.
+                if not any_chunk_seen:
+                    any_chunk_seen = True
+                    waiting.label = "Model responding (ollama)"
                 content = chunk.get("message", {}).get("content", "")
                 if content:
+                    if not first_token_seen:
+                        first_token_seen = True
+                        waiting.__exit__(None, None, None)
+                        print(ui.dim("--- begin model output ---"), file=sys.stderr)
                     full_content += content
                     sys.stderr.write(ui.dim(content))
                     sys.stderr.flush()
@@ -1292,6 +1357,8 @@ def _query_ollama_stream(req: urllib.request.Request, timeout: int, url: str) ->
                     final_meta = chunk
                     break
     except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+        if not first_token_seen:
+            waiting.__exit__(None, None, None)
         msg = str(e)
         if "timed out" in msg.lower():
             sys.exit(
@@ -1300,6 +1367,12 @@ def _query_ollama_stream(req: urllib.request.Request, timeout: int, url: str) ->
                 f"to --backend claude-code."
             )
         sys.exit(f"\nError: cannot reach Ollama at {url}: {e}")
+    finally:
+        # Stream ended without ever producing a token (server closed
+        # cleanly, empty response, etc.): make sure the spinner thread
+        # is stopped so the program can exit.
+        if not first_token_seen:
+            waiting.__exit__(None, None, None)
 
     sys.stderr.write("\n")
     print(ui.dim("--- end model output ---"), file=sys.stderr)
@@ -1325,6 +1398,329 @@ def _query_ollama_stream(req: urllib.request.Request, timeout: int, url: str) ->
     return full_content
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow HTTP redirects.
+
+    urllib's default behaviour forwards the Authorization header to the
+    redirect target, even across origins - a 302 from the configured
+    endpoint to attacker.example would leak the Bearer token. Returning
+    None here makes urllib raise the redirect status as an HTTPError,
+    which our caller surfaces cleanly.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# Built once: a no-redirect opener for the openai-compat backend. Reusing
+# it across requests is cheap and avoids re-installing handlers globally.
+_openai_opener = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def query_openai_compat(diff: str, config: dict, system_prompt: str = SYSTEM_PROMPT) -> str:
+    """Send diff to an OpenAI-compatible Chat Completions endpoint.
+
+    Targets the de-facto-standard OpenAI API shape so the same backend
+    works against LiteLLM, vLLM, OpenRouter, Groq, Together, Fireworks,
+    llama.cpp server, LM Studio, etc. API key is read from an env var
+    (default OPENAI_API_KEY) so it never lands in the committed yaml.
+    """
+    openai_config = config.get("openai", {})
+    base_url = (openai_config.get("url") or "https://api.openai.com").rstrip("/")
+    model = openai_config.get("model", "gpt-4o-mini")
+    timeout = openai_config.get("timeout", 600)
+    key_env = openai_config.get("api_key_env", "OPENAI_API_KEY")
+    allow_insecure = bool(openai_config.get("allow_insecure", False))
+
+    # Validate the URL before we do anything else. urllib happily accepts
+    # file:// (read local file), ftp://, and data:// schemes - none of
+    # which belong here and which a hostile yaml could exploit. urlparse
+    # itself can raise on malformed input (e.g. stray '[' from an ANSI
+    # escape in the yaml), so wrap it.
+    try:
+        parsed = urllib.parse.urlparse(base_url)
+    except ValueError as e:
+        sys.exit(
+            f"Error: openai.url is malformed ({e}). Got: "
+            f"{_sanitize(base_url)!r}"
+        )
+    if parsed.scheme not in ("http", "https"):
+        sys.exit(
+            f"Error: openai.url scheme must be http or https, got "
+            f"{parsed.scheme!r}. Refusing to send to {_sanitize(base_url)!r}."
+        )
+    host = parsed.hostname or ""
+    if not host:
+        sys.exit(
+            f"Error: openai.url has no hostname: {_sanitize(base_url)!r}."
+        )
+    # Block plaintext HTTP unless loopback (key/diff can't be intercepted
+    # locally) or the user has explicitly opted in. Sending a Bearer token
+    # and an entire repo diff over the clear is a real, easy-to-miss leak.
+    if parsed.scheme == "http" and host not in LOOPBACK_HOSTS and not allow_insecure:
+        sys.exit(
+            f"Error: refusing to send diff + API key over plaintext HTTP to "
+            f"{_sanitize(host)!r}. Use https://, or set "
+            f"openai.allow_insecure: true to override (you accept that the "
+            f"diff and Bearer token travel unencrypted)."
+        )
+
+    api_key = os.environ.get(key_env)
+    if not api_key:
+        sys.exit(
+            f"Error: {key_env} environment variable not set. "
+            f"Set it (or change openai.api_key_env in pwnguard.yaml) "
+            f"before using --backend openai-compat."
+        )
+
+    # Surface the destination so a misconfigured/repo-edited URL is
+    # visible at run time, not silently exfiltrating diffs. Sanitize: the
+    # host string came from yaml and could otherwise carry ANSI escapes.
+    # Host in lime, model in blue so the two pieces of "where are we
+    # sending what" pop out at a glance.
+    safe_host = _sanitize(host) or host
+    safe_model = _sanitize(model) or model
+    print(
+        ui.dim("PwnGuard: sending diff to ")
+        + ui.green(safe_host)
+        + ui.dim(" (model: ")
+        + ui.blue(safe_model)
+        + ui.dim(")"),
+        file=sys.stderr,
+    )
+
+    payload_dict: dict = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"Review this git diff for security vulnerabilities:\n\n{wrap_diff(diff)}",
+            },
+        ],
+        "stream": bool(_debug_mode),
+    }
+    # Same JSON-output toggle as the Ollama backend: when on, ask the
+    # server to constrain output to a JSON object. Supported by OpenAI,
+    # LiteLLM, vLLM (with guided_json), and most other proxies.
+    if _ollama_json_mode:
+        payload_dict["response_format"] = {"type": "json_object"}
+
+    # Forward optional tunables. num_predict -> max_tokens to match
+    # OpenAI's naming while keeping the same yaml key the user already
+    # knows from the Ollama block.
+    if (np := openai_config.get("num_predict")) is not None:
+        payload_dict["max_tokens"] = np
+    for opt_key in ("temperature", "seed", "top_p"):
+        if opt_key in openai_config:
+            payload_dict[opt_key] = openai_config[opt_key]
+
+    # In streaming mode, request the final usage chunk so we can print
+    # the same prompt/output-token metrics the Ollama backend shows.
+    if payload_dict["stream"]:
+        payload_dict["stream_options"] = {"include_usage": True}
+
+    payload = json.dumps(payload_dict).encode()
+    req = urllib.request.Request(
+        f"{base_url}/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+
+    try:
+        if _debug_mode:
+            return _query_openai_compat_stream(req, timeout, base_url)
+        with _openai_opener.open(req, timeout=timeout) as resp:
+            raw_body = resp.read()
+    except urllib.error.HTTPError as e:
+        # Surface the server's error body when present (LiteLLM and
+        # OpenAI both return useful JSON error messages here). A 3xx
+        # also lands here because we refuse redirects - that's
+        # intentional, the message tells the user to update the URL.
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        if 300 <= e.code < 400:
+            sys.exit(
+                f"Error: {_sanitize(base_url)} responded with redirect "
+                f"HTTP {e.code} (refused - Bearer token must not be "
+                f"forwarded across hosts). Update openai.url to the "
+                f"final endpoint."
+            )
+        sys.exit(
+            f"Error: {_sanitize(base_url)} returned HTTP {e.code}: "
+            f"{_sanitize(body) or e.reason}"
+        )
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+        msg = str(e)
+        if "timed out" in msg.lower():
+            sys.exit(
+                f"Request timed out after {timeout}s. Raise openai.timeout "
+                f"in pwnguard.yaml for large diffs or slower proxies."
+            )
+        sys.exit(f"Error: cannot reach {_sanitize(base_url)}: {e}")
+
+    # Decode + parse defensively: misconfigured proxies often return
+    # HTML error pages or empty bodies on 200, which would otherwise
+    # raise a cryptic JSONDecodeError mid-pipeline.
+    try:
+        data = json.loads(raw_body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        snippet = _sanitize(raw_body[:300].decode("utf-8", errors="replace")) or "(empty)"
+        sys.exit(
+            f"Error: {_sanitize(base_url)} returned a non-JSON response "
+            f"({e.__class__.__name__}). First bytes: {snippet!r}"
+        )
+
+    # OpenAI-shaped response: choices[0].message.content
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not choices or not isinstance(choices, list):
+        err = data.get("error") if isinstance(data, dict) else None
+        snippet = _sanitize(str(err or data)[:300]) or "(empty)"
+        sys.exit(f"Error: unexpected OpenAI-compatible response: {snippet}")
+    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+    content = message.get("content")
+    if not content:
+        # Empty content is what OpenAI returns on safety-stop refusals
+        # or some proxies' rate-limit/quota responses. Treat as no findings
+        # rather than crashing the whole scan.
+        return '{"findings": []}'
+    return content
+
+
+def _query_openai_compat_stream(req: urllib.request.Request, timeout: int, base_url: str) -> str:
+    """Stream an OpenAI-compatible SSE response, echoing tokens to stderr.
+
+    Mirrors _query_ollama_stream but parses Server-Sent Events
+    (`data: {...}\\n\\n` with a `data: [DONE]` sentinel) instead of
+    NDJSON. Returns the accumulated content so the rest of the
+    pipeline treats it identically to a non-streamed response.
+
+    Shows a "waiting for first token" spinner during TTFT. LiteLLM and
+    other proxies fronting large models can sit silent for many seconds
+    while prompt processing runs before the first delta arrives.
+    """
+    full_content = ""
+    final_usage: dict = {}
+    finish_reason: Optional[str] = None
+    waiting = ui.Spinner("Waiting for response (openai-compat)")
+    waiting.__enter__()
+    first_token_seen = False
+    any_chunk_seen = False
+    thinking_seen = False
+    try:
+        # Same no-redirect opener as the non-stream path: never allow
+        # the Authorization header to be forwarded to a different host.
+        with _openai_opener.open(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                line = raw_line.strip()
+                if not line or not line.startswith(b"data:"):
+                    continue
+                data_str = line[len(b"data:"):].strip()
+                if data_str == b"[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str.decode())
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                # First sign of life from the server: switch the spinner
+                # label so the user sees "model is working", not just
+                # "still waiting". The spinner thread reads .label every
+                # frame so a plain assignment is enough.
+                if not any_chunk_seen:
+                    any_chunk_seen = True
+                    waiting.label = "Model responding (openai-compat)"
+                # Usage-only chunks (sent last when stream_options.include_usage
+                # is set) carry no choices; capture and continue.
+                if usage := chunk.get("usage"):
+                    final_usage = usage
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}) if isinstance(choices[0], dict) else {}
+                # Reasoning models (DeepSeek R1, Qwen-thinking, etc.) emit
+                # `reasoning_content` (or `reasoning`) deltas before any
+                # real content. Surface that explicitly so the user knows
+                # the model is in its thinking phase, not stalled.
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                if reasoning and not thinking_seen:
+                    thinking_seen = True
+                    waiting.label = "Model is thinking (openai-compat)"
+                content = delta.get("content", "") or ""
+                if content:
+                    if not first_token_seen:
+                        first_token_seen = True
+                        waiting.__exit__(None, None, None)
+                        print(ui.dim("--- begin model output ---"), file=sys.stderr)
+                    full_content += content
+                    sys.stderr.write(ui.dim(content))
+                    sys.stderr.flush()
+                if (fr := choices[0].get("finish_reason")) is not None:
+                    finish_reason = fr
+    except urllib.error.HTTPError as e:
+        if not first_token_seen:
+            waiting.__exit__(None, None, None)
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        if 300 <= e.code < 400:
+            sys.exit(
+                f"\nError: {_sanitize(base_url)} responded with redirect "
+                f"HTTP {e.code} (refused - Bearer token must not be "
+                f"forwarded across hosts). Update openai.url to the "
+                f"final endpoint."
+            )
+        sys.exit(
+            f"\nError: {_sanitize(base_url)} returned HTTP {e.code}: "
+            f"{_sanitize(body) or e.reason}"
+        )
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+        if not first_token_seen:
+            waiting.__exit__(None, None, None)
+        msg = str(e)
+        if "timed out" in msg.lower():
+            sys.exit(
+                f"\nRequest timed out after {timeout}s. Raise openai.timeout "
+                f"in pwnguard.yaml for large diffs or slower proxies."
+            )
+        sys.exit(f"\nError: cannot reach {_sanitize(base_url)}: {e}")
+    finally:
+        # Stream ended without ever producing a token (server closed
+        # cleanly, empty response, refusal, etc.): stop the spinner
+        # thread so the program can exit.
+        if not first_token_seen:
+            waiting.__exit__(None, None, None)
+
+    # Capture elapsed since the first token arrived (waiting.elapsed
+    # reflects the TTFT phase; subtracting it from total gives a fair
+    # generation-time figure for the t/s estimate).
+    total_elapsed = time.monotonic() - (waiting._start or time.monotonic())
+    gen_elapsed = max(0.001, total_elapsed - waiting.elapsed)
+
+    sys.stderr.write("\n")
+    print(ui.dim("--- end model output ---"), file=sys.stderr)
+    # Per-request diagnostics, same shape as the Ollama summary line.
+    bits = []
+    if final_usage:
+        if pt := final_usage.get("prompt_tokens"):
+            bits.append(f"prompt: {pt} tokens")
+        if ct := final_usage.get("completion_tokens"):
+            bits.append(f"output: {ct} tokens")
+            bits.append(f"{ct / gen_elapsed:.1f} t/s")
+    if finish_reason:
+        bits.append(f"stop: {finish_reason}")
+    if bits:
+        print(ui.dim("PwnGuard: " + "  ·  ".join(bits)), file=sys.stderr)
+    return full_content
+
+
 def dispatch_backend(
     backend: str,
     diff: str,
@@ -1344,6 +1740,8 @@ def dispatch_backend(
         return query_claude_api(diff, config, system_prompt)
     if backend == "claude-code":
         return query_claude_code(diff, config, system_prompt)
+    if backend == "openai-compat":
+        return query_openai_compat(diff, config, system_prompt)
     return query_ollama(diff, config, system_prompt)
 
 
@@ -1658,7 +2056,7 @@ def _print_affected_block(
     for lineno, content in collected:
         text = _truncate(_sanitize(content), max_content)
         ln_str = str(lineno).rjust(ln_width)
-        is_target = (lineno == f.line)
+        is_target = (lineno == f.line) and _highlight_target_line
         if is_target:
             print(
                 f"{indent}{ui.red('-')} {ui.dim(ln_str)}  {ui.red(text)}"
@@ -2358,7 +2756,7 @@ def main():
     )
     parser.add_argument(
         "--backend",
-        choices=["claude-code", "ollama", "claude-api"],
+        choices=["claude-code", "ollama", "claude-api", "openai-compat"],
         default=None,
         help="AI backend (default: claude-code for hook, ollama for ci)",
     )
@@ -2521,6 +2919,7 @@ def main():
     if args.model:
         config.setdefault("ollama", {})["model"] = args.model
         config.setdefault("claude_api", {})["model"] = args.model
+        config.setdefault("openai", {})["model"] = args.model
 
     max_file_size_kb = config.get("max_file_size_kb", 100)
 
@@ -2532,7 +2931,7 @@ def main():
     elif args.code_preview == "off":
         set_code_preview(False)
     else:
-        set_code_preview(backend in ("claude-code", "claude-api"))
+        set_code_preview(backend in ("claude-code", "claude-api", "openai-compat"))
 
     # Ollama JSON mode toggle (only meaningful for the ollama backend).
     set_ollama_json_mode(args.ollama_format == "json")

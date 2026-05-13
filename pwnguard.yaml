@@ -31,6 +31,17 @@ ollama:
   temperature: 0.5    # lower = more deterministic
   seed: 42            # pin RNG for reproducible runs (any int)
 
+# OpenAI-compatible endpoint (LiteLLM, vLLM, OpenRouter, Groq, llama.cpp, etc.)
+# Use --backend openai-compat. Requires OPENAI_API_KEY env var (never the yaml).
+# openai:
+#   url: https://litellm.example.com  # base URL; /v1/chat/completions appended
+#   model: qwen3-coder-480b
+#   timeout: 600
+#   api_key_env: OPENAI_API_KEY  # override if your project uses a different name
+#   num_predict: 4096   # max output tokens (maps to OpenAI's max_tokens)
+#   temperature: 0.5
+#   seed: 42
+
 # File patterns to skip (glob syntax)
 ignore_patterns:
   - "*.min.js"
