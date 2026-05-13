@@ -53,6 +53,7 @@ language_focus:
   - ts
   - twig
   - html
+  - py
 
 # Maximum diff size (lines) before truncation
 max_diff_lines: 500

@@ -277,7 +277,7 @@ Every config key, its default, and what it controls. PwnGuard looks for
 |-----|---------|---------|
 | `severity_threshold` | `HIGH` | Minimum severity that blocks commits / merges. One of CRITICAL / HIGH / MEDIUM / LOW / INFO. |
 | `ignore_patterns` | see source | Glob patterns to skip (per file). Defaults skip `vendor/`, `node_modules/`, `*.min.js/css/map`, lock files, common test paths. |
-| `language_focus` | `[php, js, ts, twig]` | File extensions to scan (others are filtered out). Empty list = scan all. |
+| `language_focus` | `[php, js, ts, twig, python]` | File extensions to scan (others are filtered out). Empty list = scan all. |
 | `max_diff_lines` | `500` | Cap on unified-diff lines sent to the AI (non-chunked mode only). Lines beyond the cap are dropped with a `[TRUNCATED]` marker. Chunked mode skips this cap because per-file splitting handles size. |
 | `max_file_size_kb` | `100` | Cap on a single file's size (KB) in `--mode manual`. Files larger than this are skipped with a `[SKIPPED]` marker. |
 
