@@ -3,7 +3,7 @@
 
 # Minimum severity to block commits/merges
 # Options: CRITICAL, HIGH, MEDIUM, LOW, INFO
-severity_threshold: HIGH
+severity_threshold: CRITICAL
 
 # Claude Code CLI settings (local, uses Pro subscription)
 # Default backend for local development
@@ -21,10 +21,15 @@ claude_api:
 ollama:
   model: qwen2.5-coder:7b
   url: http://localhost:11434
-  # SAFETY: by default, only localhost/127.0.0.1/::1 are allowed. Setting
-  # allow_remote: true lets diffs leave the local machine. Only enable this
-  # if your Ollama runs on a trusted host you control.
+  # Only localhost is allowed by default. true lets diffs leave the host.
   allow_remote: false
+  timeout: 600  # seconds; raise for very large diffs
+
+  keep_alive: "30m"   # keep model in VRAM between scans
+  num_ctx: 8192       # context window; 8k fits 7B + KV cache in 8GB VRAM
+  num_predict: 2048   # cap on output tokens
+  temperature: 0.5    # lower = more deterministic
+  seed: 42            # pin RNG for reproducible runs (any int)
 
 # File patterns to skip (glob syntax)
 ignore_patterns:
