@@ -1,14 +1,16 @@
 #!/bin/sh
 #
-# PwnGuard - AI-powered security pre-commit hook
-# Installed automatically via composer install
+# PwnGuard pre-commit hook (PWNGUARD_HOOK_V1)
+# AI-powered security review for staged changes.
+# Installed automatically via composer install.
 #
 # Backends (auto-detected):
 #   1. Claude Code (if installed, uses Pro subscription)
 #   2. Ollama (if running locally)
 #
-# Override: pwnguard/hooks/pre-commit --backend ollama
-# Skip:     git commit --no-verify
+# Override:              pwnguard/hooks/pre-commit --backend ollama
+# Skip one commit only:  PWNGUARD_SKIP=1 git commit ...
+# Skip all hooks:        git commit --no-verify
 #
 
 # Find project root
@@ -18,6 +20,12 @@ if [ -z "$PROJECT_ROOT" ]; then
     exit 1
 fi
 
+# Per-shell escape hatch, separate from --no-verify (which skips ALL hooks).
+# Useful when iterating on WIP commits without disabling unrelated hooks.
+if [ "${PWNGUARD_SKIP:-0}" = "1" ]; then
+    exit 0
+fi
+
 AUDIT_SCRIPT="$PROJECT_ROOT/pwnguard/audit.py"
 
 if [ ! -f "$AUDIT_SCRIPT" ]; then
@@ -25,7 +33,8 @@ if [ ! -f "$AUDIT_SCRIPT" ]; then
     exit 0
 fi
 
-# Check Python is available
+# Check Python is available. PwnGuard needs Python 3.7+ (dataclasses,
+# f-strings). Python 2 is EOL since 2020 and intentionally not supported.
 if command -v python3 >/dev/null 2>&1; then
     PYTHON=python3
 elif command -v python >/dev/null 2>&1; then
@@ -35,12 +44,25 @@ else
     exit 0
 fi
 
-# Check pyyaml is installed
-$PYTHON -c "import yaml" 2>/dev/null
-if [ $? -ne 0 ]; then
-    echo "Installing pyyaml..."
-    $PYTHON -m pip install pyyaml --quiet --break-system-packages 2>/dev/null || \
-    $PYTHON -m pip install pyyaml --quiet 2>/dev/null
+# Verify it's actually Python 3.7+. If only Python 2 is installed under
+# `python`, bail gracefully instead of crashing the commit with a syntax error.
+if ! $PYTHON -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' 2>/dev/null; then
+    PY_VER=$($PYTHON -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
+    echo "PwnGuard requires Python 3.7+ (found ${PY_VER:-unknown}). Skipping."
+    exit 0
+fi
+
+# Check pyyaml is installed. Do NOT auto-install: --break-system-packages
+# silently mutates the user's system Python and can corrupt PEP 668-managed
+# environments (Debian/Ubuntu). Warn and skip instead so a missing dev dep
+# never blocks a commit.
+if ! $PYTHON -c "import yaml" 2>/dev/null; then
+    echo "PwnGuard: missing dependency 'pyyaml'. Install one of:"
+    echo "  pip install --user pyyaml"
+    echo "  pipx install pyyaml"
+    echo "  apt install python3-yaml      (or your distro equivalent)"
+    echo "Skipping security audit for this commit."
+    exit 0
 fi
 
 # Run the audit

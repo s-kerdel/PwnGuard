@@ -1,4 +1,6 @@
-pyyaml>=6.0
+# Pinned for a security tool: prevent transient deps from sneaking in.
+# Bump deliberately and review the changelog before raising the upper bound.
+pyyaml==6.0.2
 
-# Optional: only needed for claude-api backend
-# anthropic>=0.40.0
+# Optional: only needed for claude-api backend.
+# anthropic==0.40.0

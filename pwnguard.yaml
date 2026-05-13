@@ -13,7 +13,7 @@ claude_code:
 # Claude API settings (requires ANTHROPIC_API_KEY)
 # Only needed if your org has API access
 claude_api:
-  model: claude-sonnet-4-20250514
+  model: claude-opus-4-7
   max_tokens: 4096
 
 # Ollama settings (local LLM, free, offline)
@@ -21,6 +21,10 @@ claude_api:
 ollama:
   model: qwen2.5-coder:7b
   url: http://localhost:11434
+  # SAFETY: by default, only localhost/127.0.0.1/::1 are allowed. Setting
+  # allow_remote: true lets diffs leave the local machine. Only enable this
+  # if your Ollama runs on a trusted host you control.
+  allow_remote: false
 
 # File patterns to skip (glob syntax)
 ignore_patterns:
