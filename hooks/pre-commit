@@ -26,10 +26,15 @@ if [ "${PWNGUARD_SKIP:-0}" = "1" ]; then
     exit 0
 fi
 
-AUDIT_SCRIPT="$PROJECT_ROOT/pwnguard/audit.py"
-
-if [ ! -f "$AUDIT_SCRIPT" ]; then
-    echo "Warning: pwnguard/audit.py not found, skipping security check"
+# Resolve the audit script location for both supported layouts:
+#   1. Embedded install: <project>/pwnguard/audit.py
+#   2. Standalone install (PwnGuard's own repository): <project>/audit.py
+if [ -f "$PROJECT_ROOT/pwnguard/audit.py" ]; then
+    AUDIT_SCRIPT="$PROJECT_ROOT/pwnguard/audit.py"
+elif [ -f "$PROJECT_ROOT/audit.py" ]; then
+    AUDIT_SCRIPT="$PROJECT_ROOT/audit.py"
+else
+    echo "Warning: audit.py not found, skipping security check"
     exit 0
 fi
 

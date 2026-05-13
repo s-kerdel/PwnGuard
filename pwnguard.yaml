@@ -3,7 +3,7 @@
 
 # Minimum severity to block commits/merges
 # Options: CRITICAL, HIGH, MEDIUM, LOW, INFO
-severity_threshold: CRITICAL
+severity_threshold: HIGH
 
 # Claude Code CLI settings (local, uses Pro subscription)
 # Default backend for local development

@@ -16,7 +16,21 @@ HOOK_SENTINEL = "PWNGUARD_HOOK_V1"
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(script_dir)
+
+    # PwnGuard supports two install layouts:
+    #   1. Embedded: this script lives at <consumer-project>/pwnguard/
+    #      install-hook.py. The hook is installed into the parent
+    #      project's .git/hooks directory.
+    #   2. Standalone: this script lives at the root of the PwnGuard
+    #      repository (alongside .git). The hook is installed into
+    #      that same repository, so changes to PwnGuard itself are
+    #      reviewed before being committed.
+    # The presence of a .git directory next to install-hook.py
+    # distinguishes the two cases.
+    if os.path.isdir(os.path.join(script_dir, ".git")):
+        project_root = script_dir
+    else:
+        project_root = os.path.dirname(script_dir)
 
     git_hooks_dir = os.path.join(project_root, ".git", "hooks")
     source_hook = os.path.join(script_dir, "hooks", "pre-commit")
