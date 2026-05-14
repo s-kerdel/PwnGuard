@@ -240,6 +240,7 @@ Every flag accepted by `audit.py`. Default values come from
 | `--code-preview {auto,on,off}` | `auto` | Show the affected-code block + `Example:` fix snippet. `auto` = on for claude backends, off for ollama (smaller models give imprecise line numbers and skip fix examples). |
 | `--report <PATH>` | (none) | Write the findings as a Markdown report to `<PATH>`. |
 | `--debug` | off | Stream the model's output live to stderr (ollama + openai-compat backends). During prompt processing a "Waiting for response..." / "Model is thinking..." spinner shows that the server is active; once tokens start arriving the spinner exits and the stream takes over. Prints per-request stats at the end (token count, tokens-per-second, stop reason). Useful when scans return empty or stop unexpectedly. |
+| `--show-observations` | off | Also surface a short list (max 5) of neutral observations about defensive patterns the model noticed in the diff (e.g. "parameterised query used", "output escaped"). Opt-in and additive: never replaces findings, never claims code is secure. Rendered dim and clearly labelled "informational only" so it can't compete with HIGH/CRITICAL signal. Adds a small number of prompt + output tokens. |
 
 ### Decision flow
 
@@ -418,6 +419,29 @@ Machine-readable. Useful for piping into other tools:
 
 Writes the same content as the GitLab MR comment to a Markdown file.
 Useful for archiving scans or attaching to issues.
+
+### `--show-observations` (opt-in)
+
+When set, the model is also asked to list up to 5 neutral observations
+about defensive patterns it spotted in the diff (e.g. "parameterised
+SELECT", "htmlspecialchars before echo", "CSRF token compared with
+session"). The block is rendered dim under the findings (or under the
+`PASS` line when there are none) and labelled "informational only,
+not security validation":
+
+```
+Observations  ·  informational only, not security validation
+  · parameterised SELECT       src/User.php:38   user_id bound via PDO
+  · htmlspecialchars on output src/Show.php:92   HTML-escape before echo
+```
+
+Why opt-in: the model is forbidden from claiming code is "secure" or
+"safe" - observations only describe patterns observed. Even so, a list
+of "good things" can subtly give a reviewer a reason to discount real
+findings, so the default behaviour stays "silent on success" and this
+feature must be turned on per run. Adds a small number of prompt and
+output tokens. Works best on Claude backends; 7B Ollama models may
+produce noisy observations.
 
 ### `--debug`
 

@@ -154,6 +154,12 @@ _show_code_preview = True
 # block. Disabled: line numbers drift across backends; flip back when fixed.
 _highlight_target_line = False
 
+# Whether to ask the model to also surface neutral observations about
+# patterns in the diff (e.g. "parameterised SQL", "output escaped").
+# Opt-in only via --show-observations: defaults off so the hook stays
+# silent on success and the findings list never gets diluted.
+_show_observations = False
+
 # Whether to request Ollama's structured JSON output mode. On gives
 # valid JSON guaranteed but roughly doubles generation time on 7B
 # models because the constraint engine has to validate every token.
@@ -187,6 +193,12 @@ def set_debug_mode(enabled: bool) -> None:
     """Toggle verbose debug output (live token stream on stderr)."""
     global _debug_mode
     _debug_mode = enabled
+
+
+def set_show_observations(enabled: bool) -> None:
+    """Toggle the opt-in observations block. Resolved once in main()."""
+    global _show_observations
+    _show_observations = enabled
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -224,8 +236,26 @@ class Finding:
 
 
 @dataclass
+class Observation:
+    """A neutral, descriptive observation about a pattern in the diff.
+
+    Deliberately NOT a security validation: the schema and prompt forbid
+    phrasing like "this is secure" / "this is safe". The intent is to
+    surface patterns the model noticed (parameterised SQL, escaping,
+    CSRF token checks, allowlist authz) without giving the developer a
+    credential they can wave away real findings with. Opt-in only,
+    rendered dim and clearly labelled "informational".
+    """
+    pattern: str
+    file: str
+    line: Optional[int]
+    note: str
+
+
+@dataclass
 class AuditResult:
     findings: list[Finding] = field(default_factory=list)
+    observations: list[Observation] = field(default_factory=list)
     files_scanned: int = 0
     error: Optional[str] = None
     elapsed: float = 0.0  # seconds spent waiting on the AI backend
@@ -1034,7 +1064,41 @@ If no security issues are found:
 """
 
 
-def build_system_prompt(*, include_preview_fields: bool = True) -> str:
+# Appended to the system prompt only when --show-observations is on.
+# Deliberately phrased to forbid security claims: an observation
+# describes a pattern, it does NOT endorse the code as safe. The
+# distinction matters - a model saying "this is secure" gives the
+# developer a credential to dismiss real findings elsewhere in the
+# scan, which is strictly worse than no signal at all.
+OBSERVATIONS_PROMPT_FRAGMENT = """
+
+OBSERVATIONS (only because the operator requested --show-observations):
+You may also include 0-5 observations describing notable defensive
+patterns you noticed in the diff. These are NEUTRAL DESCRIPTIONS,
+never security validations.
+- DO: "parameterised query with bound id", "htmlspecialchars applied
+  to $name before echo", "CSRF token compared against session",
+  "authorisation check uses explicit allowlist of roles".
+- DO NOT: claim anything is "secure", "safe", "well-validated", "no
+  vulnerability", "correctly handled", or any phrasing that endorses
+  the code's overall security posture.
+- Omit the observations field entirely if you have nothing concrete
+  to describe. Do not pad to hit a count.
+
+Schema for each observation:
+  {"pattern": "short noun phrase", "file": "path/to/file",
+   "line": N (optional; omit if uncertain), "note": "one sentence,
+   max ~100 chars, describing what was done - not what is good"}
+
+Add an "observations" sibling field next to "findings" in the response.
+"""
+
+
+def build_system_prompt(
+    *,
+    include_preview_fields: bool = True,
+    include_observations: bool = False,
+) -> str:
     """Return the system prompt, optionally stripped of preview fields.
 
     When the rendered output won't show code previews (ollama default,
@@ -1050,20 +1114,27 @@ def build_system_prompt(*, include_preview_fields: bool = True) -> str:
 
     CWE stays because it's tiny, useful, and the model knows when it
     doesn't apply (it just omits it).
+
+    When ``include_observations`` is set (--show-observations), append
+    the observations schema. Kept additive so the findings-only path
+    stays unchanged and uncached prompts don't grow.
     """
     if include_preview_fields:
-        return SYSTEM_PROMPT
-    p = SYSTEM_PROMPT
-    # 1) Drop the fix_example OPTIONAL FIELDS bullet (multi-line).
-    p = re.sub(r'- "fix_example":(?:.|\n)*?\n(?=- ")', "", p)
-    # 2) Drop fix_example from the JSON example.
-    p = re.sub(r'^\s*"fix_example": "[^"]*",\n', "", p, flags=re.MULTILINE)
-    # 3) Drop the STYLE sentence singling out fix_example.
-    p = re.sub(r' The "fix_example" field is[^.]*\.', "", p)
-    # 4) Drop the line OPTIONAL FIELDS bullet (multi-line).
-    p = re.sub(r'- "line":(?:.|\n)*?\n(?=- ")', "", p)
-    # 5) Drop line from the JSON example.
-    p = re.sub(r'^\s*"line": \d+,\n', "", p, flags=re.MULTILINE)
+        p = SYSTEM_PROMPT
+    else:
+        p = SYSTEM_PROMPT
+        # 1) Drop the fix_example OPTIONAL FIELDS bullet (multi-line).
+        p = re.sub(r'- "fix_example":(?:.|\n)*?\n(?=- ")', "", p)
+        # 2) Drop fix_example from the JSON example.
+        p = re.sub(r'^\s*"fix_example": "[^"]*",\n', "", p, flags=re.MULTILINE)
+        # 3) Drop the STYLE sentence singling out fix_example.
+        p = re.sub(r' The "fix_example" field is[^.]*\.', "", p)
+        # 4) Drop the line OPTIONAL FIELDS bullet (multi-line).
+        p = re.sub(r'- "line":(?:.|\n)*?\n(?=- ")', "", p)
+        # 5) Drop line from the JSON example.
+        p = re.sub(r'^\s*"line": \d+,\n', "", p, flags=re.MULTILINE)
+    if include_observations:
+        p = p + OBSERVATIONS_PROMPT_FRAGMENT
     return p
 
 # Prompt used when re-querying for a single finding via --explain.
@@ -1735,7 +1806,10 @@ def dispatch_backend(
     7B local models).
     """
     if system_prompt is None:
-        system_prompt = build_system_prompt(include_preview_fields=_show_code_preview)
+        system_prompt = build_system_prompt(
+            include_preview_fields=_show_code_preview,
+            include_observations=_show_observations,
+        )
     if backend == "claude-api":
         return query_claude_api(diff, config, system_prompt)
     if backend == "claude-code":
@@ -1832,6 +1906,27 @@ def parse_response(response: str) -> AuditResult:
             cwe=_sanitize(raw_cwe) if raw_cwe else None,
             confidence=confidence,
             fix_example=_sanitize(raw_fix_example) if raw_fix_example else None,
+        ))
+
+    # Observations (opt-in via --show-observations). Best-effort parse:
+    # missing field, empty list, or non-dict items all silently degrade
+    # to "no observation added" rather than failing the whole scan.
+    for item in (data.get("observations") or []):
+        if not isinstance(item, dict):
+            continue
+        pattern = _sanitize(item.get("pattern", "")).strip()
+        note = _sanitize(item.get("note", "")).strip()
+        if not pattern and not note:
+            continue
+        # Cap at 5 to enforce the prompt's stated ceiling on the parse
+        # side too - a runaway model can't flood the output.
+        if len(result.observations) >= 5:
+            break
+        result.observations.append(Observation(
+            pattern=pattern or "(unspecified)",
+            file=_sanitize(item.get("file", "")).strip(),
+            line=item.get("line") if isinstance(item.get("line"), int) else None,
+            note=note,
         ))
     return result
 
@@ -2159,6 +2254,27 @@ def _file_header(filepath: str, findings: list) -> str:
     return ui.underline(ui.bold(link))
 
 
+def _print_observations(result: AuditResult) -> None:
+    """Render the opt-in observations block.
+
+    Dim styling, explicit "informational only" label, no severity
+    markers - the visual treatment is intentionally quieter than
+    findings so the block can never compete with HIGH/CRITICAL output.
+    Skips silently when the list is empty so unused screen space
+    doesn't appear on success/PASS runs that happened to opt in but
+    produced nothing.
+    """
+    if not result.observations:
+        return
+    print()
+    print(ui.dim("Observations  ·  informational only, not security validation"))
+    for o in result.observations:
+        loc = f"{o.file}:{o.line}" if o.line and o.file else (o.file or "")
+        loc_part = f"  {ui.dim(loc)}" if loc else ""
+        note_part = f"  {ui.dim(o.note)}" if o.note else ""
+        print(f"  {ui.dim('·')} {ui.dim(o.pattern)}{loc_part}{note_part}")
+
+
 def print_terminal(
     result: AuditResult,
     threshold: str,
@@ -2185,6 +2301,7 @@ def print_terminal(
         return
 
     if not result.findings:
+        _print_observations(result)
         print()
         print(f"{ui.bold(ui.green('PASS'))}  No security issues found.")
         print()
@@ -2208,6 +2325,7 @@ def print_terminal(
                 _print_finding_block(f, diff_lines)
 
     _print_summary(result)
+    _print_observations(result)
     _print_footer(result, threshold)
 
 
@@ -2807,6 +2925,17 @@ def main():
         help="Output raw JSON instead of formatted text",
     )
     parser.add_argument(
+        "--show-observations",
+        action="store_true",
+        help=(
+            "Also surface a short list of neutral observations about "
+            "defensive patterns the model noticed in the diff (e.g. "
+            "'parameterised query', 'output escaped'). Opt-in only, "
+            "additive: never replaces findings, never claims code is "
+            "secure. Adds a small number of prompt + output tokens."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be sent to AI without sending",
@@ -2941,6 +3070,10 @@ def main():
     # actually streams (Claude Code / Claude API run as a single call).
     set_debug_mode(args.debug)
 
+    # Opt-in observations block. Default off so the standard hook flow
+    # stays silent on success and findings never get diluted.
+    set_show_observations(args.show_observations)
+
     # Dry-run: build the diff and report what would be sent, then exit.
     if args.dry_run:
         if args.from_url:
@@ -3013,6 +3146,10 @@ def main():
             "blocked": result.exceeds_threshold(threshold),
             "elapsed_seconds": round(result.elapsed, 2),
         }
+        # Only surface the observations key when the flag was passed so
+        # downstream consumers don't see an unexpected empty list.
+        if _show_observations:
+            output["observations"] = [asdict(o) for o in result.observations]
         if result.error:
             output["error"] = result.error
         print(json.dumps(output, indent=2))
