@@ -1,6 +1,6 @@
 # PwnGuard
 
-> **Status: Proof of Concept (`v0.1.1`).**
+> **Status: Proof of Concept (`v0.1.2`).**
 > PwnGuard is published as a reference / portfolio piece. It works
 > end-to-end, but the config schema, prompt format, and CLI flags may
 > change without notice before a `1.0` release. Don't rely on it as
@@ -129,15 +129,48 @@ Extracts staged diff (only changed files)
 Filters by ignore_patterns + language_focus
     |
     v
-Sends to Claude Code / Claude API / Ollama
+Tags each content line with an opaque anchor token  ([a1] [a2] ...)
+and builds an anchor -> (file, line) lookup table
     |
     v
-Parses JSON response into findings
+Sends to Claude Code / Claude API / Ollama / OpenAI-compat
+    |
+    v
+Parses JSON response. Each finding carries its anchor;
+the host resolves it back to (file, line) via the table
     |
     v
 HIGH or CRITICAL found? --> Block commit (exit 1)
 Otherwise                --> Allow commit (exit 0)
 ```
+
+### Locating findings: opaque anchor tokens
+
+Every added / context line in the diff is prefixed with a short
+**opaque token** (`[a1]`, `[a2]`, ...) before it is sent to the model.
+The model is told to report each finding's location by **echoing the
+token back** in an `anchor` field; it does **not** report file paths
+or line numbers itself. The host then resolves the anchor against the
+table it built during tagging - a single dict lookup per finding.
+
+Why it matters:
+
+- **No line-counting drift.** Tokens are opaque - they can only be
+  copied, not regenerated from "where this code probably is", which
+  was the failure mode of plain line-number prefixes on smaller
+  models past ~30 rows.
+- **Cross-file collisions cannot happen.** Two functions named
+  `lookup_user` in two files get distinct anchors, so a finding's
+  file/line is never inferred by string-matching.
+- **Loud failure on fabrication.** If the model invents an unknown
+  token, the finding is dropped with a stderr warning instead of
+  being silently mis-located.
+
+The pipeline degrades gracefully: if a model genuinely cannot tie a
+finding to one line (a project-wide config concern, missing-file
+issue), it omits `anchor` and supplies a bare `file` instead. Those
+file-level findings are kept; everything else must resolve through
+the table.
 
 ## Common workflows
 
@@ -219,8 +252,8 @@ Every flag accepted by `audit.py`. Default values come from
 | `--mode {hook,ci,manual}` | `hook` | Source of the diff. `hook` = staged diff, `ci` = MR target-branch diff, `manual` = files you pass with `--files`. |
 | `--files <PATH ...>` | (none) | Files to scan in `manual` mode. Multiple paths allowed. |
 | `--mr-diff` | off | In `hook` mode, fetch the MR target-branch diff (same as `--mode ci`). |
-| `--diff-file <PATH>` | (none) | Read a unified diff from disk instead of running git. Useful for offline testing or replaying a saved diff. |
-| `--from-url <URL>` | (none) | Fetch the diff from a GitLab MR / GitHub PR / commit URL via API. See [Remote fetching](#remote-fetching-from-gitlab--github). |
+| `--diff-file <PATH>` | (none) | Read a unified diff from disk instead of running git. Useful for offline testing or replaying a saved diff. Input is validated up front: a file that doesn't look like a unified diff (no `diff --git` / `+++ b/` headers) is refused with a precise hint pointing to `--mode manual --files <PATH>` instead. |
+| `--from-url <URL>` | (none) | Fetch the diff from a GitLab MR / GitHub PR / commit URL via API. See [Remote fetching](#remote-fetching-from-gitlab--github). Same shape-check as `--diff-file`: if the platform returns HTML (auth failure, rate limit, outage) instead of a diff, the run aborts with a preview of what came back rather than silently scanning nothing. |
 
 ### Backend + model
 
@@ -282,6 +315,7 @@ Every config key, its default, and what it controls. PwnGuard looks for
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `severity_threshold` | `HIGH` | Minimum severity that blocks commits / merges. One of CRITICAL / HIGH / MEDIUM / LOW / INFO. |
+| `backend` | (auto-detect) | Pin the AI backend for this project (overrides hook/ci auto-detection). One of `claude-code`, `ollama`, `claude-api`, `openai-compat`. The `--backend` CLI flag always wins; per-developer override goes in `pwnguard.local.yaml`. |
 | `ignore_patterns` | see source | Glob patterns to skip (per file). Defaults skip `vendor/`, `node_modules/`, `*.min.js/css/map`, lock files, common test paths. |
 | `language_focus` | `[php, js, ts, twig, python]` | File extensions to scan (others are filtered out). Empty list = scan all. |
 | `max_diff_lines` | `500` | Cap on unified-diff lines sent to the AI (non-chunked mode only). Lines beyond the cap are dropped with a `[TRUNCATED]` marker. Chunked mode skips this cap because per-file splitting handles size. |
@@ -406,7 +440,21 @@ Machine-readable. Useful for piping into other tools:
 
 ```json
 {
-  "findings": [ { "severity": "HIGH", "title": "...", "file": "...", ... } ],
+  "findings": [
+    {
+      "severity": "HIGH",
+      "confidence": "high",
+      "title": "sql injection via user_id in lookup_user",
+      "file": "app/users.py",
+      "line": 244,
+      "anchor": "a10",
+      "description": "...",
+      "recommendation": "...",
+      "cwe": "CWE-89",
+      "fix_example": "cur.execute('SELECT ... WHERE id = ?', (user_id,))",
+      "hunk_context": "def lookup_user(user_id):"
+    }
+  ],
   "summary": { "HIGH": 1, "MEDIUM": 2 },
   "files_scanned": 3,
   "threshold": "HIGH",
@@ -414,6 +462,10 @@ Machine-readable. Useful for piping into other tools:
   "elapsed_seconds": 4.2
 }
 ```
+
+`file` and `line` are populated by the host after the model echoes back
+its `anchor` token; consumers can rely on them. The `anchor` itself is
+included for debugging / traceability.
 
 ### `--report <PATH>`
 
@@ -530,10 +582,11 @@ What lower-B models miss:
 - Framework-specific auth bypass patterns (Shopware ACL, CakePHP
   `allowUnauthenticated`).
 - Optional JSON fields like `fix_example` are frequently dropped.
-- Exact line numbers - 7B models often anchor on the function
-  declaration rather than the actual sink. PwnGuard shows a ±3 line
-  window around the reported line, so the real vulnerable code is
-  usually visible even when the marker is one or two rows off.
+- **Anchor choice quality** - the file and line themselves are always
+  correct (resolved from the opaque-token table, not the model's own
+  counting), but a 7B model may anchor to a function header instead
+  of the exact statement inside the function. The ±3-line context
+  window around the anchored line keeps the real sink visible.
 
 If the local quality isn't enough for your codebase, switch to the
 `claude-code` backend (uses your Pro subscription, no local VRAM, much
@@ -627,12 +680,13 @@ hard gate.
 - Ollama (especially 7B) is less accurate than Claude for security
   review. `--code-preview auto` hides the affected-code block on the
   ollama backend so missing-fix-example fields don't leave empty
-  cards. Line numbers drift on every backend we've tried (including
-  mid-sized OpenAI-compat models and occasionally Claude), so the
-  red `-` target marker in the affected-code block is currently
-  suppressed globally; the ±3-line context window still renders so
-  you see the area, just without a misleading "this exact row"
-  pointer.
+  cards. The red `-` target marker on the exact line is currently
+  suppressed globally (the model can still anchor to a function
+  header instead of the inner statement); the ±3-line context window
+  still renders so you see the area. File and line themselves are
+  resolved via opaque anchor tokens and are reliable - the marker
+  suppression is only about which row inside the window the model
+  picked, not about whether the location is correct.
 - Reproducibility on Ollama depends on `seed` + `temperature`; without
   pinning the seed, the same diff can produce different findings
   across runs.

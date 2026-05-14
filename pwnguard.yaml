@@ -5,6 +5,13 @@
 # Options: CRITICAL, HIGH, MEDIUM, LOW, INFO
 severity_threshold: HIGH
 
+# Default AI backend for this project. Overrides auto-detection (which
+# would pick claude-code locally, claude-api/ollama in CI). Comment out
+# to fall back to the auto-detect behaviour. CLI flag --backend always
+# wins. Personal override: pwnguard.local.yaml (gitignored).
+# Options: claude-code, ollama, claude-api, openai-compat
+# backend: openai-compat
+
 # Claude Code CLI settings (local, uses Pro subscription)
 # Default backend for local development
 claude_code:

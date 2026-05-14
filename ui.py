@@ -67,6 +67,10 @@ SEVERITY_COLOR = {
     "MEDIUM":   C.ORANGE,
     "LOW":      C.CYAN,
     "INFO":     C.GRAY,
+    # Observations sit outside the severity scale - black background +
+    # white text gives a neutral badge that can't be confused with any
+    # severity colour. Foreground stays default-white when used inline.
+    "OBSERVATION": C.WHITE,
 }
 
 # Backgrounds + matching contrast letter colours for the severity badges.
@@ -74,11 +78,20 @@ SEVERITY_COLOR = {
 # slot so the two reds are distinguishable side-by-side. White letters on
 # both red shades for contrast.
 SEVERITY_BG = {
-    "CRITICAL": C.BG_RED,            # \x1b[41m
+    # CRITICAL uses pure-red 256-colour slot 196 (RGB 255/0/0) rather
+    # than the basic ANSI bright-red (41), which on many terminals
+    # rendered softer/oranger than HIGH's darker slot 124. Slot 196
+    # restores the intended visual gradient: CRITICAL > HIGH > MEDIUM.
+    "CRITICAL": "\033[48;5;196m",
     "HIGH":     "\033[48;5;124m",    # 256-colour dark red
     "MEDIUM":   C.BG_ORANGE,
     "LOW":      C.BG_CYAN,
     "INFO":     C.BG_GRAY,
+    # Dark-gray 256-colour slot, not raw "\033[40m". On dark-themed
+    # terminals raw black blends into the background and the badge
+    # disappears - slot 235 stays visibly darker than INFO's bright-black
+    # while still reading as a neutral "outside the severity scale" tone.
+    "OBSERVATION": "\033[48;5;235m",
 }
 SEVERITY_FG_ON_BG = {
     "CRITICAL": C.WHITE,
@@ -86,6 +99,7 @@ SEVERITY_FG_ON_BG = {
     "MEDIUM":   C.BLACK,
     "LOW":      C.BLACK,
     "INFO":     C.WHITE,
+    "OBSERVATION": C.WHITE,
 }
 
 
@@ -235,6 +249,20 @@ def term_width(default: int = 80) -> int:
     except OSError:
         cols = default
     return max(40, cols)
+
+
+def term_height(default: int = 24) -> int:
+    """Detected terminal height, with a sane lower bound.
+
+    Used by the review TUI to decide how many findings can fit on
+    screen at once so the cursor's expanded card never scrolls past
+    the visible area.
+    """
+    try:
+        rows = shutil.get_terminal_size((80, default)).lines
+    except OSError:
+        rows = default
+    return max(10, rows)
 
 
 # Strips both SGR (colors) and OSC 8 hyperlink sequences so visible_len()
