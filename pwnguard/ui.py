@@ -3,8 +3,9 @@ PwnGuard UI primitives: ANSI styling, hyperlinks, spinner, terminal width,
 and a minimal raw-mode key reader for the interactive review TUI.
 
 All terminal styling lives here so a future theme (or a plain/markdown
-output mode) only has to touch this one file. audit.py never emits raw
-ANSI codes; it calls helpers like ``ui.bold`` / ``ui.severity_color``.
+output mode) only has to touch this one file. The rest of the package
+never emits raw ANSI codes; it calls helpers like ``ui.bold`` /
+``ui.severity_color``.
 """
 
 import contextlib
@@ -49,7 +50,8 @@ class C:
     BG_GRAY = "\033[100m"
 
 
-# Severity -> ANSI color. Kept here (not in audit.py) so themes are local.
+# Severity -> ANSI color. Kept here (not in the rendering module) so themes
+# are local.
 #
 # Severity ordering visually:
 #   CRITICAL = bright red    (\x1b[91m)
@@ -519,5 +521,3 @@ class Spinner:
             i += 1
             # 80 ms cadence; using stop.wait() makes us interruptible.
             self._stop.wait(0.08)
-
-

@@ -1,0 +1,34 @@
+PwnGuard License
+
+Copyright (c) 2026 Power to Logic. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to use the
+Software for personal, educational, and internal business purposes.
+
+The following conditions apply:
+
+1. Redistribution of the Software, in whole or in part, in original or modified
+   form, requires prior written consent from the copyright holder.
+
+2. Where redistribution is authorized, the following attribution must be
+   included in all copies or substantial portions of the Software and in any
+   accompanying documentation or distribution materials:
+
+       "PwnGuard by Power to Logic (https://github.com/s-kerdel)"
+
+3. The Software may not be sold, sublicensed, or offered as a paid product or
+   service without prior written consent from the copyright holder.
+
+4. Contributions submitted to the official repository (via pull requests,
+   patches, or other means) are granted to the copyright holder under the same
+   terms as this license, unless otherwise agreed in writing.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+For redistribution inquiries, contact: privacy@powertologic.com

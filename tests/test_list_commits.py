@@ -10,6 +10,7 @@ import json
 import pytest
 
 import audit
+import pwnguard.fetchers
 
 
 @pytest.fixture
@@ -21,7 +22,9 @@ def captured(monkeypatch):
         state["headers"] = headers
         return state["response"]
 
-    monkeypatch.setattr(audit, "_http_get", fake_http_get)
+    # See test_fetch_url.py for why we patch the source module rather
+    # than the audit.py shim.
+    monkeypatch.setattr(pwnguard.fetchers, "_http_get", fake_http_get)
     return state
 
 

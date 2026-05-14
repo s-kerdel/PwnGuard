@@ -1,6 +1,6 @@
 # PwnGuard
 
-> **Status: Proof of Concept (`v0.2.1`).**
+> **Status: Proof of Concept (`v0.2.3`).**
 > PwnGuard is published as a reference / portfolio piece. It works
 > end-to-end, but the config schema, prompt format, and CLI flags may
 > change without notice before a `1.0` release. Don't rely on it as
@@ -111,7 +111,7 @@ The pre-commit hook is now installed. Every developer who runs
 
 ### Requirements
 
-- Python 3.7+ (Python 2 is **not** supported; EOL since 2020)
+- Python 3.9+ (uses builtin-generic syntax like `list[Finding]`; Python 2 is **not** supported, EOL since 2020)
 - `pyyaml==6.0.2` (install with `pip install --user pyyaml`)
 - One of: Claude Code CLI, an Ollama server, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` (for any OpenAI-compatible endpoint)
 

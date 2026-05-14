@@ -11,6 +11,7 @@ import json
 import pytest
 
 import audit
+import pwnguard.fetchers
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +28,11 @@ def captured(monkeypatch):
         state["headers"] = headers
         return state["response"]
 
-    monkeypatch.setattr(audit, "_http_get", fake_http_get)
+    # _http_get's actual home after the split is pwnguard.fetchers.
+    # Patching audit._http_get would only reassign the re-exported
+    # alias on the shim; the call sites inside pwnguard.fetchers
+    # would still hit the original. Target the real module.
+    monkeypatch.setattr(pwnguard.fetchers, "_http_get", fake_http_get)
     return state
 
 

@@ -38,8 +38,9 @@ else
     exit 0
 fi
 
-# Check Python is available. PwnGuard needs Python 3.7+ (dataclasses,
-# f-strings). Python 2 is EOL since 2020 and intentionally not supported.
+# Check Python is available. PwnGuard needs Python 3.9+ (builtin-generic
+# syntax like list[Finding]). Python 2 is EOL since 2020 and intentionally
+# not supported.
 if command -v python3 >/dev/null 2>&1; then
     PYTHON=python3
 elif command -v python >/dev/null 2>&1; then
@@ -49,11 +50,12 @@ else
     exit 0
 fi
 
-# Verify it's actually Python 3.7+. If only Python 2 is installed under
-# `python`, bail gracefully instead of crashing the commit with a syntax error.
-if ! $PYTHON -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' 2>/dev/null; then
+# Verify it's actually Python 3.9+. If an older Python is the only one
+# under `python`, bail gracefully instead of crashing the commit with a
+# syntax error.
+if ! $PYTHON -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
     PY_VER=$($PYTHON -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
-    echo "PwnGuard requires Python 3.7+ (found ${PY_VER:-unknown}). Skipping."
+    echo "PwnGuard requires Python 3.9+ (found ${PY_VER:-unknown}). Skipping."
     exit 0
 fi
 

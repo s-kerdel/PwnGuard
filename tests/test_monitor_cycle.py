@@ -13,6 +13,7 @@ test_list_commits.py and test_fetch_url.py).
 import pytest
 
 import audit
+import pwnguard.monitor
 
 
 @pytest.fixture
@@ -63,8 +64,11 @@ def patched(monkeypatch):
         diff_lines = calls["next_diff_lines"].get((repo_url, sha), {})
         return result, diff_lines
 
-    monkeypatch.setattr(audit, "list_commits_from_url", fake_list)
-    monkeypatch.setattr(audit, "_audit_commit_for_monitor", fake_audit)
+    # _run_monitor_refresh lives in pwnguard.monitor and calls these
+    # via its own module-level bindings, so we patch them on the source
+    # module rather than the audit.py re-export shim.
+    monkeypatch.setattr(pwnguard.monitor, "list_commits_from_url", fake_list)
+    monkeypatch.setattr(pwnguard.monitor, "_audit_commit_for_monitor", fake_audit)
 
     calls["next_shas"] = {}
     calls["next_findings"] = {}
@@ -240,7 +244,7 @@ def test_one_repo_error_does_not_abort_others(cfg, state, patched, monkeypatch):
         if "alpha" in url:
             raise SystemExit("alpha listing failed")
         return ["sha_b1"]
-    monkeypatch.setattr(audit, "list_commits_from_url", fake_list)
+    monkeypatch.setattr(pwnguard.monitor, "list_commits_from_url", fake_list)
 
     summary = audit._run_monitor_refresh(cfg, state, "ollama")
 
