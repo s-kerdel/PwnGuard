@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# PwnGuard pre-commit hook (PWNGUARD_HOOK_V1)
+# PwnGuard pre-commit hook (PWNGUARD_HOOK_V2)
 # AI-powered security review for staged changes.
 # Installed automatically via composer install.
 #
@@ -68,6 +68,33 @@ if ! $PYTHON -c "import yaml" 2>/dev/null; then
     echo "  apt install python3-yaml      (or your distro equivalent)"
     echo "Skipping security audit for this commit."
     exit 0
+fi
+
+# Self-test: when committing changes to PwnGuard itself (standalone
+# layout: audit.py at repo root AND tests/ present), run the bundled
+# pytest suite before the security scan. Failures here mean the
+# auditor's own invariants regressed - block the commit, since a
+# broken auditor produces unreliable findings.
+#
+# This branch deliberately does NOT fire for consumer repos: their
+# audit.py lives under pwnguard/, not at root, so the first check
+# ($PROJECT_ROOT/audit.py exists AND tests/ exists) is false.
+if [ -f "$PROJECT_ROOT/audit.py" ] && [ -f "$PROJECT_ROOT/tests/test_anchors.py" ]; then
+    if $PYTHON -c "import pytest" 2>/dev/null; then
+        echo "PwnGuard: running internal test suite..."
+        $PYTHON -m pytest "$PROJECT_ROOT/tests/" --quiet
+        TEST_EXIT=$?
+        if [ $TEST_EXIT -ne 0 ]; then
+            echo ""
+            echo "Commit blocked: PwnGuard internal tests failed (exit $TEST_EXIT)."
+            echo "Fix the failures above before committing, or skip with: git commit --no-verify"
+            echo ""
+            exit 1
+        fi
+    else
+        echo "PwnGuard: pytest not installed; skipping internal test suite."
+        echo "  pip install --user -r requirements-dev.txt"
+    fi
 fi
 
 # Run the audit

@@ -1,0 +1,8 @@
+# Dev / test dependencies. NOT required to run PwnGuard - the test
+# suite is the only consumer. Install with:
+#
+#     pip install --user -r requirements-dev.txt
+#
+# Pinned for reproducibility, same philosophy as the runtime requirements:
+# bump deliberately and review the changelog before raising bounds.
+pytest==9.0.3

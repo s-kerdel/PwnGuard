@@ -11,7 +11,15 @@ import stat
 
 # Bump the version suffix when the shipped hook script changes in an
 # incompatible way; older installs are then refreshed on next composer run.
-HOOK_SENTINEL = "PWNGUARD_HOOK_V1"
+# v2: added the self-test step that runs pytest on PwnGuard's own repo
+# before the security scan (no-op on consumer installs).
+HOOK_SENTINEL = "PWNGUARD_HOOK_V2"
+
+# Prefix used to detect "this hook was previously installed by PwnGuard
+# (at any version)". A version-pinned check would refuse to overwrite
+# older PwnGuard hooks during an upgrade, so we match the prefix
+# instead and only treat unrelated content as a user-owned hook.
+HOOK_OWNED_PREFIX = "PWNGUARD_HOOK_"
 
 
 def main():
@@ -48,12 +56,15 @@ def main():
                 content = f.read()
         except OSError:
             content = ""
-        if HOOK_SENTINEL not in content:
+        if HOOK_OWNED_PREFIX not in content:
             print("  [pwnguard] Existing pre-commit hook found, not overwriting")
             print("  [pwnguard] Add this line to your hook:")
             print("    python3 pwnguard/audit.py --mode hook")
             return
-        print("  [pwnguard] Updating pre-commit hook")
+        if HOOK_SENTINEL in content:
+            print("  [pwnguard] Pre-commit hook already up to date")
+        else:
+            print("  [pwnguard] Upgrading pre-commit hook to " + HOOK_SENTINEL)
     else:
         print("  [pwnguard] Installing pre-commit hook")
 

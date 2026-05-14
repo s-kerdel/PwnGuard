@@ -49,7 +49,7 @@ from typing import Optional
 # Local sibling module; works because Python prepends script dir to sys.path.
 import ui
 
-__version__ = "0.1.2"  # PoC; bump when behaviour or config schema changes.
+__version__ = "0.1.3"  # PoC; bump when behaviour or config schema changes.
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -3699,6 +3699,51 @@ def run_scan(
 # Main
 # ---------------------------------------------------------------------------
 
+def _run_self_test() -> int:
+    """Run the bundled pytest suite against tests/ and return its exit code.
+
+    Looks for the tests directory next to this file (standalone layout:
+    ``audit.py`` and ``tests/`` share a parent) or one level up
+    (consumer layout: ``pwnguard/audit.py`` and ``pwnguard/tests/`` -
+    same parent walk, just different starting point). Runs pytest as a
+    subprocess so it doesn't entangle audit.py's own argparse state
+    with pytest's collection.
+    """
+    audit_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(audit_dir, "tests"),
+        os.path.join(os.path.dirname(audit_dir), "tests"),
+    ]
+    tests_dir = next(
+        (p for p in candidates
+         if os.path.isdir(p) and os.path.isfile(os.path.join(p, "test_anchors.py"))),
+        None,
+    )
+    if tests_dir is None:
+        print(
+            ui.red("Error:") + " tests/ directory not found next to audit.py.\n"
+            "  Looked in:\n"
+            + "".join(f"    {p}\n" for p in candidates),
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        import pytest  # noqa: F401  - probed for presence only
+    except ImportError:
+        print(
+            ui.red("Error:") + " pytest is not installed. Install dev deps:\n"
+            "  pip install --user -r requirements-dev.txt",
+            file=sys.stderr,
+        )
+        return 2
+    print(ui.dim(f"PwnGuard: running test suite in {tests_dir}"), file=sys.stderr)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", tests_dir, "-v"],
+        check=False,
+    )
+    return result.returncode
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="pwnguard",
@@ -3861,8 +3906,25 @@ def main():
             "per file) but avoids silent truncation."
         ),
     )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help=(
+            "Run PwnGuard's bundled test suite (anchor pipeline, JSON "
+            "parser repair, diff validation, box-card width math) and "
+            "exit with pytest's status code. Useful for verifying that "
+            "an install is healthy. Requires pytest "
+            "(pip install --user -r requirements-dev.txt)."
+        ),
+    )
 
     args = parser.parse_args()
+
+    # --self-test short-circuits every other flag: it doesn't touch the
+    # AI backend, doesn't read a diff, doesn't load yaml. Run pytest
+    # against the bundled tests/ dir and exit with its status.
+    if args.self_test:
+        sys.exit(_run_self_test())
 
     # Configure UI before any styled output.
     ui.configure(color=ui.should_use_color(no_color_flag=args.no_color))

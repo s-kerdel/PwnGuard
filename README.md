@@ -1,6 +1,6 @@
 # PwnGuard
 
-> **Status: Proof of Concept (`v0.1.2`).**
+> **Status: Proof of Concept (`v0.1.3`).**
 > PwnGuard is published as a reference / portfolio piece. It works
 > end-to-end, but the config schema, prompt format, and CLI flags may
 > change without notice before a `1.0` release. Don't rely on it as
@@ -113,6 +113,33 @@ The pre-commit hook is now installed. Every developer who runs
 - Python 3.7+ (Python 2 is **not** supported; EOL since 2020)
 - `pyyaml==6.0.2` (install with `pip install --user pyyaml`)
 - One of: Claude Code CLI, an Ollama server, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` (for any OpenAI-compatible endpoint)
+
+### Running the test suite
+
+Tests live in `tests/` and cover the anchor pipeline, JSON parse +
+repair stages, diff input validation, and box-card width math. Install
+the dev deps and run pytest from the project root:
+
+```bash
+pip install --user -r requirements-dev.txt
+python3 -m pytest tests/ -v
+```
+
+No network, no LLM calls - the tests exercise the deterministic
+pieces directly so a regression in the anchor system or the parser
+fallbacks fails fast.
+
+Two convenience entry points:
+
+- `python3 audit.py --self-test` — same suite, callable from anywhere
+  an install of PwnGuard is reachable. Useful for verifying a fresh
+  install is healthy.
+- **Pre-commit auto-run (PwnGuard's own repo only)** — when this
+  repo's pre-commit hook fires, it runs `pytest tests/` *before* the
+  security scan. Test failures block the commit, since a regressed
+  auditor produces unreliable findings. Detected by the standalone
+  layout (`audit.py` at repo root + `tests/test_anchors.py` present),
+  so consumer projects never see this step.
 
 ## How it works
 
