@@ -245,6 +245,65 @@ def test_observations_resolve_same_way(anchor_table):
 # End-to-end: build a diff, simulate a model response, resolve back
 # ---------------------------------------------------------------------------
 
+def test_diff_with_no_hunk_header_produces_empty_table():
+    """File rename / mode-only changes have +++ but no @@ - no content
+    lines exist, so the anchor table stays empty."""
+    rename_only = (
+        "diff --git a/old.py b/new.py\n"
+        "similarity index 100%\n"
+        "rename from old.py\n"
+        "rename to new.py\n"
+    )
+    _, table = audit.wrap_diff(rename_only)
+    assert table == {}
+
+
+def test_large_anchor_namespace_remains_unique_and_sequential():
+    """200+ anchors in one diff: every token unique, increments by 1,
+    no collisions between added and context lines."""
+    body_lines = "\n".join(f"+    line {i}" for i in range(200))
+    big_diff = (
+        "diff --git a/big.py b/big.py\n"
+        "--- a/big.py\n"
+        "+++ b/big.py\n"
+        f"@@ -1,1 +1,200 @@\n"
+        f"{body_lines}\n"
+    )
+    _, table = audit.wrap_diff(big_diff)
+    assert len(table) == 200
+    ids = sorted(int(tok[1:]) for tok in table)
+    assert ids == list(range(1, 201))
+    # Every line number is unique and sequential too.
+    lines = sorted(m["line"] for m in table.values())
+    assert lines == list(range(1, 201))
+
+
+def test_anchor_table_unaffected_by_token_literal_in_source():
+    """Source content containing what looks like an anchor token
+    ([a99]) must NOT collide with the host-built table. The tagger
+    increments sequentially regardless of content; the literal is
+    just text inside an added line."""
+    diff = (
+        "diff --git a/x.py b/x.py\n"
+        "--- a/x.py\n"
+        "+++ b/x.py\n"
+        "@@ -1,1 +1,3 @@\n"
+        " before\n"
+        '+    cache_key = f"[a99]:{user_id}"\n'
+        "+    return cache_key\n"
+    )
+    _, table = audit.wrap_diff(diff)
+    # Three content lines tagged in order: context line at 1, two added
+    # lines at 2 and 3. Tokens are a1/a2/a3, not whatever the source
+    # happens to mention.
+    assert sorted(table.keys()) == ["a1", "a2", "a3"]
+    assert "a99" not in table
+    # The literal `[a99]` survives unchanged inside the line content.
+    a2 = table["a2"]
+    assert "[a99]" in a2["content"]
+    assert a2["line"] == 2
+
+
 def test_full_roundtrip(simple_diff):
     _, table = audit.wrap_diff(simple_diff)
     target = next(tok for tok, m in table.items()

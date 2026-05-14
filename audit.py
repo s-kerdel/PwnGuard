@@ -49,7 +49,7 @@ from typing import Optional
 # Local sibling module; works because Python prepends script dir to sys.path.
 import ui
 
-__version__ = "0.1.3"  # PoC; bump when behaviour or config schema changes.
+__version__ = "0.1.4"  # PoC; bump when behaviour or config schema changes.
 
 # ---------------------------------------------------------------------------
 # Constants

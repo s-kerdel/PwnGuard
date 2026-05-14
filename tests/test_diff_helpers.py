@@ -138,3 +138,128 @@ def test_parse_diff_files_lists_all():
 
 def test_parse_diff_files_empty_returns_empty():
     assert audit.parse_diff_files("") == []
+
+
+# ---------------------------------------------------------------------------
+# filter_diff - first thing that touches user-supplied content
+# ---------------------------------------------------------------------------
+
+def _make_diff(*paths: str) -> str:
+    """Build a minimal one-line-add diff covering each path."""
+    chunks = []
+    for path in paths:
+        chunks.append(
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n"
+            f"+++ b/{path}\n"
+            f"@@ -1,1 +1,2 @@\n"
+            f" existing\n"
+            f"+added\n"
+        )
+    return "".join(chunks)
+
+
+def test_filter_diff_drops_files_matching_ignore_patterns():
+    diff = _make_diff("src/app.py", "vendor/lib.py", "src/utils.js")
+    config = {"ignore_patterns": ["vendor/*"], "language_focus": []}
+    out = audit.filter_diff(diff, config, apply_truncation=False)
+    assert "src/app.py" in out
+    assert "src/utils.js" in out
+    assert "vendor/lib.py" not in out
+
+
+def test_filter_diff_keeps_only_focused_extensions():
+    diff = _make_diff("a.py", "b.md", "c.txt", "d.js")
+    config = {"ignore_patterns": [], "language_focus": ["py", "js"]}
+    out = audit.filter_diff(diff, config, apply_truncation=False)
+    assert "a.py" in out
+    assert "d.js" in out
+    assert "b.md" not in out
+    assert "c.txt" not in out
+
+
+def test_filter_diff_empty_language_focus_keeps_everything():
+    diff = _make_diff("a.py", "b.md", "c.txt")
+    config = {"ignore_patterns": [], "language_focus": []}
+    out = audit.filter_diff(diff, config, apply_truncation=False)
+    for path in ("a.py", "b.md", "c.txt"):
+        assert path in out
+
+
+def test_filter_diff_truncation_applied_by_default():
+    """Long diff hits max_diff_lines cap when apply_truncation defaults on."""
+    diff = _make_diff(*[f"f{i}.py" for i in range(50)])
+    config = {
+        "ignore_patterns": [], "language_focus": [],
+        "max_diff_lines": 20,
+    }
+    out = audit.filter_diff(diff, config)
+    assert "[TRUNCATED:" in out
+    assert len(out.splitlines()) <= 20 + 2  # cap + trailing marker block
+
+
+def test_filter_diff_truncation_skipped_for_chunked_mode():
+    """apply_truncation=False keeps every line so the per-file splitter
+    sees every file - chunked-mode contract."""
+    diff = _make_diff(*[f"f{i}.py" for i in range(50)])
+    config = {
+        "ignore_patterns": [], "language_focus": [],
+        "max_diff_lines": 20,
+    }
+    out = audit.filter_diff(diff, config, apply_truncation=False)
+    assert "[TRUNCATED:" not in out
+
+
+# ---------------------------------------------------------------------------
+# _truncate_diff
+# ---------------------------------------------------------------------------
+
+def test_truncate_below_cap_unchanged():
+    diff = "line 1\nline 2\nline 3"
+    assert audit._truncate_diff(diff, max_lines=10) == diff
+
+
+def test_truncate_at_cap_unchanged():
+    """`<=` semantics - exactly at the cap stays intact."""
+    diff = "\n".join(f"line {i}" for i in range(10))
+    assert audit._truncate_diff(diff, max_lines=10) == diff
+
+
+def test_truncate_above_cap_emits_marker():
+    diff = "\n".join(f"line {i}" for i in range(20))
+    out = audit._truncate_diff(diff, max_lines=10)
+    assert "[TRUNCATED: 10 lines omitted]" in out
+    # Lines beyond the cap are gone.
+    assert "line 15" not in out
+
+
+# ---------------------------------------------------------------------------
+# build_system_prompt - regression guard for the slim-mode regex strip
+# (a fix_example value with escaped quotes used to defeat the regex
+# and leave "fix_example" in the slim prompt; v0.1.2 fixed it).
+# ---------------------------------------------------------------------------
+
+def test_full_prompt_has_anchor_field_and_fix_example():
+    p = audit.build_system_prompt(include_preview_fields=True)
+    assert '"anchor"' in p
+    assert "fix_example" in p
+    assert "code_snippet" not in p
+
+
+def test_slim_prompt_strips_fix_example_fully():
+    """Bullet AND JSON-example mention of fix_example must be gone."""
+    p = audit.build_system_prompt(include_preview_fields=False)
+    assert "fix_example" not in p
+    # anchor is non-negotiable - even slim prompts need it.
+    assert '"anchor"' in p
+
+
+def test_observations_appended_when_requested():
+    p = audit.build_system_prompt(include_observations=True)
+    assert "observations" in p
+    assert '"anchor"' in p
+
+
+def test_observations_omitted_by_default():
+    p = audit.build_system_prompt(include_observations=False)
+    assert "OBSERVATIONS" not in p
