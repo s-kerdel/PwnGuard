@@ -78,3 +78,19 @@ max_diff_lines: 500
 
 # Maximum single file size (KB) to include
 max_file_size_kb: 100
+
+# Monitor mode: when invoked with --monitor PwnGuard opens a TUI
+# dashboard that watches these repos, audits the latest commit on
+# each branch when it changes, and lets you step through findings
+# without re-running the audit. State is cached in
+# .pwnguard-monitor.json in the current working directory.
+# Uncomment and adapt:
+#
+# monitor:
+#   repos:
+#     - name: api-server
+#       url: https://gitlab.com/group/api-server
+#       branch: main
+#     - name: vendor-fork
+#       url: https://github.com/owner/repo
+#       branch: upstream

@@ -1,6 +1,6 @@
 # PwnGuard
 
-> **Status: Proof of Concept (`v0.1.4`).**
+> **Status: Proof of Concept (`v0.2.0`).**
 > PwnGuard is published as a reference / portfolio piece. It works
 > end-to-end, but the config schema, prompt format, and CLI flags may
 > change without notice before a `1.0` release. Don't rely on it as
@@ -27,6 +27,7 @@ automatically via `composer install`.
 - [Exit codes](#exit-codes)
 - [Output modes](#output-modes)
 - [Interactive review (TUI)](#interactive-review-tui)
+- [Monitor mode (`--monitor`)](#monitor-mode---monitor)
 - [Remote fetching from GitLab / GitHub](#remote-fetching-from-gitlab--github)
 - [Choosing an Ollama model](#choosing-an-ollama-model)
 - [When the diff doesn't fit in the local model](#when-the-diff-doesnt-fit-in-the-local-model)
@@ -577,6 +578,120 @@ select and copy it), CWE link (bright blue + underlined, OSC 8 clickable
 in modern terminals), the affected code with red `-` prefix + line
 numbers, the description, and a bold-green `Fix:` recommendation, all
 inside a dashed card.
+
+## Monitor mode (`--monitor`)
+
+A dashboard TUI that watches one or more remote repos, audits the
+latest commit on each watched branch when it changes, and lets you
+step through findings without re-running the audit. Designed for
+"catch attention on new released work" workflows — you get a quick
+heads-up that something landed, then validate manually.
+
+Open the dashboard:
+
+```bash
+python3 audit.py --monitor
+```
+
+State is cached in `.pwnguard-monitor.json` in the current working
+directory (per-project), with mode `0600` on Unix. Run from two
+different directories and you get two independent caches.
+
+### Configure repos in `pwnguard.yaml`
+
+```yaml
+monitor:
+  repos:
+    - name: api-server
+      url: https://gitlab.com/group/api-server
+      branch: main
+    - name: vendor-fork
+      url: https://github.com/owner/repo
+      branch: upstream
+```
+
+Each entry needs `name`, `url`, and `branch`. Hostname must contain
+`gitlab` or `github` for the platform to auto-detect; custom-domain
+self-hosted instances are not yet supported in monitor mode.
+
+### Key bindings
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Move the cursor between repos |
+| `enter` | Toggle expand / collapse on the current repo |
+| `→` | Expand (alternative to `enter`) |
+| `←` | Collapse (alternative to `enter`) |
+| `space` | Mark the current repo viewed (clears the `[updated]` chip) |
+| `r` | Refresh (poll all repos via API, audit anything new) |
+| `q` (or `esc`) | Save state and quit |
+
+### How a refresh works
+
+For each configured repo, PwnGuard calls the platform's list-commits
+API, compares the latest SHA on the branch to the cached
+`last_audited_sha`, and decides:
+
+- **First encounter** — no cached SHA yet. The current HEAD is
+  audited so the dashboard reflects branch state immediately on the
+  first `[r]` press. Costs one LLM call per repo on initial setup.
+  The `[updated]` chip is suppressed on this initial audit (you're
+  staring at the result; nothing to "catch up on").
+- **No change** — head matches cache. Skip; no LLM call.
+- **New commit** — exactly one commit (the latest) is audited.
+  Intermediate commits between cache and head are not audited; the
+  diff against `last_audited_sha` is what gets sent to the model.
+  The `[updated]` chip fires until you press `[space]`.
+
+The cap of one commit per repo per refresh keeps the worst-case
+refresh time bounded and avoids ballooning the prompt past a small
+model's context window. If a backlog of unscanned commits matters
+for your workflow, this is the knob to revisit in a follow-up
+release.
+
+### The `[updated]` chip
+
+A repo row shows `[updated]` when `last_audited_sha != last_viewed_sha`
+— i.e. PwnGuard has audited a new commit since you last acknowledged
+this repo. Pressing `[space]` while the cursor is on the row sets
+viewed = audited and the chip clears.
+
+### What the state file contains
+
+```json
+{
+  "version": 1,
+  "repos": {
+    "https://gitlab.com/group/api-server@main": {
+      "name":             "api-server",
+      "last_audited_sha": "abc1234...",
+      "last_viewed_sha":  "abc1234...",
+      "audited_at":       "2026-05-15T09:14:00+00:00",
+      "findings":         [ /* asdict(Finding) per finding */ ]
+    }
+  }
+}
+```
+
+The file is JSON (never `pickle` — that would be unsafe to load
+from disk). Findings are re-sanitized on load as belt-and-braces
+against an offline-tampered cache; even a hand-edited state file
+can't smuggle ANSI escapes into the renderer. Tokens are read from
+env vars only and **never** persisted.
+
+### Limits of the first cut
+
+- One commit per refresh, per repo (no batch / range scanning yet).
+- No background poller; refresh runs synchronously in the TUI and
+  blocks for the duration. Wire `pwnguard --monitor` to a wrapper
+  later if you want it on a cron schedule.
+- No notification outputs (Slack / email / etc.). Findings live in
+  the TUI and the state file.
+- No platform support beyond GitLab and GitHub (custom-domain
+  self-hosted instances are deferred until there's a clean way to
+  configure platform explicitly).
+- Concurrent runs of `--monitor` in the same cwd will race on the
+  state file. Treated as a cache; last writer wins.
 
 ## Remote fetching from GitLab / GitHub
 

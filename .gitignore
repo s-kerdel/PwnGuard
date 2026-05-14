@@ -35,3 +35,6 @@ dist/
 # Tool output
 audit-report.*
 *.log
+
+# Monitor mode cache (per-cwd state file, never to be committed)
+.pwnguard-monitor.json

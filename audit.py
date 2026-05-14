@@ -44,12 +44,13 @@ import urllib.parse
 import urllib.request
 import yaml
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from typing import Optional
 
 # Local sibling module; works because Python prepends script dir to sys.path.
 import ui
 
-__version__ = "0.1.4"  # PoC; bump when behaviour or config schema changes.
+__version__ = "0.2.0"  # PoC; bump when behaviour or config schema changes.
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1130,6 +1131,127 @@ def _fetch_github_commit(parsed: urllib.parse.ParseResult) -> str:
         headers["Authorization"] = f"Bearer {token}"
 
     return _http_get(api_url, headers).decode("utf-8", errors="replace")
+
+
+def _list_gitlab_commits(
+    parsed: urllib.parse.ParseResult,
+    branch: str,
+    limit: int = 1,
+) -> list:
+    """Return up to ``limit`` most-recent commit SHAs on ``branch``.
+
+    URL shape is ``https://<host>/<group>/<project>`` - the repo root,
+    no /-/<thing> suffix. The function tolerates a trailing slash and
+    will also accept a URL that still carries ``/-/...`` from a copy-
+    paste by taking the part before ``/-/``.
+    """
+    head = parsed.path.split("/-/")[0]
+    project_path = head.strip("/")
+    if not project_path or "/" not in project_path:
+        sys.exit(f"Invalid GitLab project URL: {parsed.geturl()!r}")
+
+    token = os.environ.get("GITLAB_TOKEN") or os.environ.get("PWNGUARD_GITLAB_TOKEN")
+    if not token:
+        sys.exit("GitLab list-commits requires GITLAB_TOKEN env var (api or read_api).")
+
+    encoded = urllib.parse.quote(project_path, safe="")
+    api_url = (
+        f"{parsed.scheme}://{parsed.netloc}/api/v4/projects/{encoded}/"
+        f"repository/commits"
+        f"?ref_name={urllib.parse.quote(branch)}&per_page={int(limit)}"
+    )
+    body = _http_get(api_url, {"PRIVATE-TOKEN": token})
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        sys.exit(f"GitLab returned non-JSON for commit list: {e}")
+    if not isinstance(data, list):
+        sys.exit(f"GitLab commit list: expected array, got {type(data).__name__}")
+    return [item["id"] for item in data if isinstance(item, dict) and "id" in item]
+
+
+def _list_github_commits(
+    parsed: urllib.parse.ParseResult,
+    branch: str,
+    limit: int = 1,
+) -> list:
+    """Return up to ``limit`` most-recent commit SHAs on ``branch``.
+
+    URL shape is ``https://github.com/<owner>/<repo>`` (or the GitHub
+    Enterprise equivalent under ``/api/v3``). Newest first.
+    """
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) < 2:
+        sys.exit(f"Invalid GitHub URL: {parsed.geturl()!r}")
+    owner, repo = parts[:2]
+
+    if parsed.netloc.endswith("github.com"):
+        api_base = "https://api.github.com"
+    else:
+        api_base = f"{parsed.scheme}://{parsed.netloc}/api/v3"
+    api_url = (
+        f"{api_base}/repos/{owner}/{repo}/commits"
+        f"?sha={urllib.parse.quote(branch)}&per_page={int(limit)}"
+    )
+
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("PWNGUARD_GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    body = _http_get(api_url, headers)
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        sys.exit(f"GitHub returned non-JSON for commit list: {e}")
+    if not isinstance(data, list):
+        sys.exit(f"GitHub commit list: expected array, got {type(data).__name__}")
+    return [item["sha"] for item in data if isinstance(item, dict) and "sha" in item]
+
+
+def _build_commit_url(repo_url: str, sha: str) -> str:
+    """Compose a per-commit URL the existing ``fetch_from_url`` accepts,
+    given a repo base URL and a commit SHA.
+
+    Platform is inferred from the hostname (same heuristic as
+    ``list_commits_from_url``).
+    """
+    parsed = urllib.parse.urlparse(repo_url)
+    if not parsed.scheme or not parsed.netloc:
+        sys.exit(f"Invalid repo URL: {repo_url!r}")
+    host = parsed.netloc.lower()
+    base = repo_url.rstrip("/")
+    if "gitlab" in host:
+        return f"{base}/-/commit/{sha}"
+    if "github" in host:
+        return f"{base}/commit/{sha}"
+    sys.exit(
+        f"Cannot determine platform from URL: {repo_url!r}\n"
+        f"Hostname must contain 'gitlab' or 'github'."
+    )
+
+
+def list_commits_from_url(url: str, branch: str, limit: int = 1) -> list:
+    """Dispatch list-commits to the right platform based on URL host.
+
+    Hostname heuristic: substring "gitlab" -> GitLab, "github" -> GitHub.
+    Covers gitlab.com / github.com plus common self-hosted naming
+    (gitlab.example.com, github.internal). Custom-domain self-hosted
+    installs would need a ``platform:`` config knob - deferred.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        sys.exit(f"Invalid URL: {url!r} (expected http(s)://...)")
+    host = parsed.netloc.lower()
+    if "gitlab" in host:
+        return _list_gitlab_commits(parsed, branch, limit)
+    if "github" in host:
+        return _list_github_commits(parsed, branch, limit)
+    sys.exit(
+        f"Cannot determine platform from URL: {url!r}\n"
+        f"Hostname must contain 'gitlab' or 'github'. Custom-domain "
+        f"self-hosted instances are not yet supported in monitor mode."
+    )
 
 
 def fetch_from_url(url: str) -> str:
@@ -3357,6 +3479,528 @@ def interactive_review(
 
 
 # ---------------------------------------------------------------------------
+# Monitor mode: TUI
+# ---------------------------------------------------------------------------
+
+def _format_short_sha(sha: Optional[str]) -> str:
+    if not sha:
+        return "—"
+    return sha[:7]
+
+
+def _finding_from_state_dict(d: dict) -> Finding:
+    """Reconstruct a Finding from its asdict() form stored in state.
+
+    Filters unknown keys so older state files with extra fields don't
+    crash the constructor.
+    """
+    fields = set(Finding.__dataclass_fields__)
+    cleaned = {k: v for k, v in d.items() if k in fields}
+    return Finding(**cleaned)
+
+
+def _render_monitor_row(
+    entry: dict,
+    *,
+    is_expanded: bool,
+    is_current: bool,
+    width: int,
+) -> None:
+    """Print one repo header row. Findings, if any, are rendered as
+    separate items beneath (see _render_monitor_finding_row); this
+    function only handles the header line so the dashboard cursor
+    can target the repo and its findings independently.
+    """
+    name = entry.get("name") or entry.get("url") or "?"
+    sha = entry.get("last_audited_sha")
+    last_viewed = entry.get("last_viewed_sha")
+    findings = entry.get("findings") or []
+    n = len(findings)
+    audited = sha is not None
+    updated = audited and (sha != last_viewed)
+
+    cursor_mark = ui.bold(">") if is_current else " "
+    arrow = "▼" if is_expanded else "▶"
+    name_styled = ui.bold(name) if is_current else name
+    if not audited:
+        count_text = ui.dim("  awaiting first refresh")
+    elif n:
+        count_text = ui.dim(f"  {n} finding{'s' if n != 1 else ''}")
+    else:
+        count_text = ui.dim("  clean")
+    left = f" {cursor_mark} {arrow}  {name_styled}{count_text}"
+
+    short = _format_short_sha(sha)
+    chip = ui.dim("[updated]") if updated else ""
+    right_parts = [ui.dim(short)]
+    if chip:
+        right_parts.append(chip)
+    right = "  ".join(right_parts)
+
+    pad = max(2, width - ui.visible_len(left) - ui.visible_len(right))
+    print(left + (" " * pad) + right)
+
+    # If expanded but no findings, the dashboard's items list won't
+    # have any finding rows to render under this header; print a hint
+    # in that case so the user understands why expansion looks empty.
+    if is_expanded and not findings:
+        if not audited:
+            print(ui.dim(
+                "        not yet audited — press [r] to refresh"
+            ))
+        else:
+            print(ui.dim("        no findings on this commit"))
+
+
+def _render_monitor_finding_row(
+    f: Finding,
+    *,
+    is_expanded: bool,
+    is_current: bool,
+    width: int,
+) -> None:
+    """Print a finding row inside the monitor dashboard.
+
+    Indented one column under the repo header. Collapsed form shows
+    severity badge + title + right-aligned file:line / CWE. Expanded
+    form uses the shared finding-card helper so the full description,
+    suggestion, and fix_example render the same way they do in
+    ``--review``. ``diff_lines`` is empty here because monitor doesn't
+    cache the underlying diff - the card falls back to a
+    "(no code preview)" placeholder where ``--review`` would show
+    the ±3 line window.
+    """
+    cursor_mark = ui.bold(">") if is_current else " "
+    badge = _severity_marker(f.severity)
+    if is_current:
+        title_text = ui.bold(ui.severity_color(f.title, f.severity))
+    else:
+        title_text = f.title
+
+    meta = _build_metadata(f)
+
+    if not is_expanded:
+        prefix = f"   {cursor_mark}  {badge}  {title_text}"
+        title_w = ui.visible_len(prefix)
+        meta_w = ui.visible_len(meta)
+        if meta_w and title_w + META_MIN_GAP + meta_w <= width:
+            pad = width - title_w - meta_w
+            print(prefix + (" " * pad) + meta)
+        else:
+            print(prefix)
+            if meta_w:
+                print((" " * max(0, width - meta_w)) + meta)
+        return
+
+    # Expanded: reuse the boxed-card helper from --review. The cursor
+    # mark sits to the left of the box's top corner via nav_prefix;
+    # subsequent lines indent under it.
+    nav_prefix = f"   {cursor_mark}  "
+    _render_finding_card(
+        f, {}, width=width, outer_indent="", nav_prefix=nav_prefix,
+    )
+
+
+def _build_monitor_items(
+    state: dict,
+    keys: list,
+    repo_expanded: dict,
+) -> list:
+    """Flatten the dashboard into an item list the cursor can index.
+
+    Each item is ``(kind, repo_key, finding_idx)`` where ``kind`` is
+    either ``"repo"`` (then ``finding_idx`` is None) or ``"finding"``.
+    Findings only appear when their repo is expanded - collapsing a
+    repo removes its findings from the cursor reachable set.
+    """
+    items = []
+    for key in keys:
+        items.append(("repo", key, None))
+        if repo_expanded.get(key, False):
+            entry = state.get("repos", {}).get(key) or {}
+            findings = entry.get("findings") or []
+            for i in range(len(findings)):
+                items.append(("finding", key, i))
+    return items
+
+
+def _render_monitor(
+    state: dict,
+    keys: list,
+    items: list,
+    cursor: int,
+    repo_expanded: dict,
+    finding_expanded: dict,
+    status_line: str,
+) -> None:
+    """Full-screen redraw of the monitor dashboard.
+
+    ``items`` is the flat (repo + finding) list the cursor indexes
+    into; ``keys`` is just the repo subset used for header counts.
+    """
+    ui.clear_screen()
+    width = ui.term_width()
+    height = ui.term_height()
+    n_repos = len(keys)
+
+    header_lines = [
+        ui.bold("PwnGuard Monitor") + ui.dim(
+            f"  ·  {n_repos} repo{'s' if n_repos != 1 else ''}"
+        ),
+        ui.dim(
+            "  up/down navigate   enter toggle (or right/left)   "
+            "space=mark viewed   r=refresh   q=quit"
+        ),
+    ]
+    header_lines += _capture(_print_legend)
+    header_lines.append("")
+    footer_lines = ["", ui.dim(f"  {status_line}")]
+
+    if not items:
+        for line in header_lines:
+            print(line)
+        print(ui.dim(
+            "  No repos configured. Add a monitor.repos[] block to "
+            "pwnguard.yaml."
+        ))
+        for line in footer_lines:
+            print(line)
+        sys.stdout.flush()
+        return
+
+    # Render each item into a buffer so we can measure for windowing.
+    item_blocks = []
+    for i, (kind, key, idx) in enumerate(items):
+        if kind == "repo":
+            entry = state.get("repos", {}).get(key) or {}
+            block = _capture(
+                _render_monitor_row,
+                entry,
+                is_expanded=repo_expanded.get(key, False),
+                is_current=(i == cursor),
+                width=width,
+            )
+        else:  # finding
+            entry = state.get("repos", {}).get(key) or {}
+            findings = entry.get("findings") or []
+            if idx is None or idx >= len(findings):
+                block = [ui.dim("        (finding gone)")]
+            else:
+                try:
+                    f = _finding_from_state_dict(findings[idx])
+                except (TypeError, KeyError):
+                    block = [ui.dim("        (finding malformed)")]
+                else:
+                    block = _capture(
+                        _render_monitor_finding_row,
+                        f,
+                        is_expanded=finding_expanded.get((key, idx), False),
+                        is_current=(i == cursor),
+                        width=width,
+                    )
+        item_blocks.append(block)
+
+    n = len(items)
+    available = max(1, height - len(header_lines) - len(footer_lines))
+    total = sum(len(b) for b in item_blocks)
+
+    if total <= available:
+        visible_indices = list(range(n))
+        hidden_above = 0
+        hidden_below = 0
+    else:
+        # Same windowing approach as --review: pin cursor block, grow
+        # downward, then upward, leaving room for ↑/↓ indicators when
+        # rows remain clipped.
+        visible_indices = [cursor]
+        used = len(item_blocks[cursor])
+        below = cursor + 1
+        while below < n:
+            need = len(item_blocks[below]) + (1 if below + 1 < n else 0)
+            if used + need > available:
+                break
+            visible_indices.append(below)
+            used += len(item_blocks[below])
+            below += 1
+        hidden_below = n - below
+        above = cursor - 1
+        while above >= 0:
+            need = len(item_blocks[above]) + (1 if above > 0 else 0)
+            if used + need > available:
+                break
+            visible_indices.insert(0, above)
+            used += len(item_blocks[above])
+            above -= 1
+        hidden_above = above + 1
+
+    for line in header_lines:
+        print(line)
+    if hidden_above:
+        print(ui.dim(
+            f"  ↑ {hidden_above} row{'s' if hidden_above != 1 else ''} above"
+        ))
+    for idx_v in visible_indices:
+        for line in item_blocks[idx_v]:
+            print(line)
+    if hidden_below:
+        print(ui.dim(
+            f"  ↓ {hidden_below} row{'s' if hidden_below != 1 else ''} below"
+        ))
+    for line in footer_lines:
+        print(line)
+    sys.stdout.flush()
+
+
+def _summarise_refresh(summary: dict) -> str:
+    """Format a one-line summary of a refresh cycle for the status bar."""
+    audited = sum(1 for v in summary.values() if v == "audited")
+    unchanged = sum(1 for v in summary.values() if v == "unchanged")
+    errors = sum(1 for v in summary.values()
+                 if isinstance(v, str) and v.startswith("error"))
+    parts = []
+    if audited:
+        parts.append(f"{audited} audited")
+    if unchanged:
+        parts.append(f"{unchanged} unchanged")
+    if errors:
+        parts.append(f"{errors} error{'s' if errors != 1 else ''}")
+    return "refresh: " + ", ".join(parts) if parts else "refresh: nothing to do"
+
+
+def _ensure_repo_entries(state: dict, config: dict) -> dict:
+    """Pre-populate state with placeholder entries for every configured
+    repo that doesn't already have one.
+
+    Without this step, a freshly-opened TUI (state file missing or
+    config just gained a new repo) renders ``?`` for every name and
+    ``awaiting first refresh`` for every row would have nothing
+    backing it. Placeholders carry the user's configured ``name`` /
+    ``url`` / ``branch`` so the dashboard is meaningful even before
+    the first ``[r]`` press. ``name`` is refreshed on every call so
+    renaming an entry in yaml takes effect on the next launch.
+    """
+    monitor_cfg = config.get("monitor", {}) or {}
+    cfg_repos = monitor_cfg.get("repos", []) or []
+    repos = state.setdefault("repos", {})
+    for r in cfg_repos:
+        if not isinstance(r, dict):
+            continue
+        url = r.get("url")
+        branch = r.get("branch")
+        if not url or not branch:
+            continue
+        key = _repo_key(url, branch)
+        name = r.get("name") or url
+        entry = repos.get(key)
+        if entry is None:
+            repos[key] = {
+                "name": name,
+                "url": url,
+                "branch": branch,
+                "last_audited_sha": None,
+                "last_viewed_sha": None,
+                "audited_at": None,
+                "findings": [],
+            }
+        else:
+            entry["name"] = name
+            entry["url"] = url
+            entry["branch"] = branch
+    return state
+
+
+def _ordered_monitor_keys(state: dict, config: dict) -> list:
+    """Order repos by config order, then any orphaned state entries.
+
+    Keeps the dashboard layout stable across runs: a repo listed third
+    in pwnguard.yaml always renders third, even if its state entry was
+    written months ago.
+    """
+    monitor_cfg = config.get("monitor", {}) or {}
+    cfg_repos = monitor_cfg.get("repos", []) or []
+    cfg_keys = [
+        _repo_key(r["url"], r["branch"])
+        for r in cfg_repos
+        if isinstance(r, dict) and r.get("url") and r.get("branch")
+    ]
+    state_keys = list((state.get("repos") or {}).keys())
+    orphans = [k for k in state_keys if k not in cfg_keys]
+    return cfg_keys + orphans
+
+
+def interactive_monitor(
+    config: dict,
+    backend: str,
+    state_path: str,
+) -> None:
+    """Open the monitor TUI: dashboard of configured repos with cached
+    findings, refreshable on demand.
+
+    Keys:
+      up / down         navigate
+      enter             toggle expand / collapse on the current repo
+      right             expand current repo (show findings)
+      left              collapse
+      space, x          mark current repo viewed (clears [updated] chip)
+      r                 refresh (poll all repos, audit anything new)
+      q, esc, Ctrl-C    save state and quit
+    """
+    if (not ui.CbreakTerminal.available
+            or not sys.stdin.isatty()
+            or not sys.stdout.isatty()):
+        print(
+            ui.dim("PwnGuard: monitor TUI unavailable (non-TTY or Windows)."),
+            file=sys.stderr,
+        )
+        return
+
+    monitor_cfg = config.get("monitor", {}) or {}
+    cfg_repos = monitor_cfg.get("repos", []) or []
+    if not cfg_repos:
+        print(
+            ui.red("Error:")
+            + " no monitor.repos[] configured in pwnguard.yaml.",
+            file=sys.stderr,
+        )
+        return
+
+    state = _load_monitor_state(state_path)
+    # Materialise an entry for every configured repo so the dashboard
+    # renders the user's name + branch even on the very first launch,
+    # before any refresh has populated last_audited_sha.
+    _ensure_repo_entries(state, config)
+    keys = _ordered_monitor_keys(state, config)
+    # Two expansion dictionaries: repo-level toggle controls which
+    # findings are reachable in the item list; finding-level toggle
+    # controls whether a finding renders as a one-liner or the full
+    # boxed card. Using dicts keyed by stable identifiers means the
+    # state survives a refresh that adds or reorders repos / findings.
+    repo_expanded: dict = {}
+    finding_expanded: dict = {}
+    items = _build_monitor_items(state, keys, repo_expanded)
+    cursor = 0
+    status_line = "loaded cached state — press [r] to refresh"
+
+    def _refresh_items(prev_anchor=None):
+        """Rebuild the items list and try to keep the cursor on the
+        same logical row across expand / collapse / refresh.
+
+        ``prev_anchor`` is the (kind, key, idx) tuple the cursor was
+        on before the change. If that exact item still exists in the
+        new list we land there; if it's been collapsed away (e.g.
+        cursor was on a finding under a repo that just closed), we
+        fall back to that repo's row.
+        """
+        nonlocal items, cursor
+        items = _build_monitor_items(state, keys, repo_expanded)
+        if not items:
+            cursor = 0
+            return
+        if prev_anchor is not None:
+            for i, it in enumerate(items):
+                if it == prev_anchor:
+                    cursor = i
+                    return
+            # Fall back: same repo, repo row.
+            kind, key, _ = prev_anchor
+            for i, it in enumerate(items):
+                if it[0] == "repo" and it[1] == key:
+                    cursor = i
+                    return
+        cursor = min(cursor, len(items) - 1)
+
+    _refresh_items()
+
+    try:
+        with ui.CbreakTerminal():
+            while True:
+                _render_monitor(
+                    state, keys, items, cursor,
+                    repo_expanded, finding_expanded, status_line,
+                )
+                try:
+                    pressed = ui.read_key()
+                except KeyboardInterrupt:
+                    break
+
+                if pressed in ("q", "esc"):
+                    break
+                if not items:
+                    if pressed == "r":
+                        pass  # fall through to refresh handling below
+                    else:
+                        continue
+
+                current = items[cursor] if items else None
+
+                if pressed == "up" and items:
+                    cursor = (cursor - 1) % len(items)
+                elif pressed == "down" and items:
+                    cursor = (cursor + 1) % len(items)
+                elif pressed in ("enter", "right", "left") and current:
+                    kind, key, idx = current
+                    if kind == "repo":
+                        if pressed == "right":
+                            new = True
+                        elif pressed == "left":
+                            new = False
+                        else:
+                            new = not repo_expanded.get(key, False)
+                        repo_expanded[key] = new
+                        _refresh_items(prev_anchor=current)
+                    else:  # finding
+                        ekey = (key, idx)
+                        if pressed == "right":
+                            finding_expanded[ekey] = True
+                        elif pressed == "left":
+                            finding_expanded[ekey] = False
+                        else:
+                            finding_expanded[ekey] = (
+                                not finding_expanded.get(ekey, False)
+                            )
+                elif pressed in ("space", "x") and current:
+                    kind, key, _ = current
+                    if kind == "repo":
+                        entry = state["repos"].get(key)
+                        if entry:
+                            entry["last_viewed_sha"] = entry.get("last_audited_sha")
+                            status_line = (
+                                f"marked '{entry.get('name', '?')}' viewed"
+                            )
+                elif pressed == "r":
+                    status_line = "refreshing..."
+                    _render_monitor(
+                        state, keys, items, cursor,
+                        repo_expanded, finding_expanded, status_line,
+                    )
+
+                    def _progress(i, total, name, msg):
+                        nonlocal status_line
+                        status_line = (
+                            f"refresh {i}/{total} · {name} · {msg}"
+                        )
+                        _render_monitor(
+                            state, keys, items, cursor,
+                            repo_expanded, finding_expanded, status_line,
+                        )
+
+                    try:
+                        summary = _run_monitor_refresh(
+                            config, state, backend, progress=_progress,
+                        )
+                    except SystemExit as e:
+                        status_line = f"refresh aborted: {e.code}"
+                        continue
+                    _save_monitor_state(state, state_path)
+                    keys = _ordered_monitor_keys(state, config)
+                    _refresh_items(prev_anchor=current)
+                    status_line = _summarise_refresh(summary)
+    finally:
+        # Persist marks-viewed and any other in-memory changes on exit.
+        _save_monitor_state(state, state_path)
+
+
+# ---------------------------------------------------------------------------
 # --watch loop
 # ---------------------------------------------------------------------------
 
@@ -3699,6 +4343,243 @@ def run_scan(
 # Main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Monitor mode: state management
+# ---------------------------------------------------------------------------
+
+MONITOR_STATE_FILENAME = ".pwnguard-monitor.json"
+MONITOR_STATE_VERSION = 1
+
+
+def _repo_key(url: str, branch: str) -> str:
+    """Canonical state-file key for a (repo url, branch) pair.
+
+    Two monitored entries that differ only by branch must not collide,
+    hence the explicit ``@<branch>`` suffix instead of using the URL
+    alone.
+    """
+    return f"{url.rstrip('/')}@{branch}"
+
+
+def _load_monitor_state(path: str) -> dict:
+    """Read the monitor cache file, or return an empty skeleton.
+
+    Missing file is normal (first run). Malformed file is treated the
+    same way: warn on stderr, return a fresh skeleton, let the next
+    save overwrite it. Skipping a corrupt cache is preferable to
+    crashing the TUI; the worst case is we re-audit one commit.
+    """
+    skeleton = {"version": MONITOR_STATE_VERSION, "repos": {}}
+    if not os.path.exists(path):
+        return skeleton
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(
+            ui.dim(
+                f"PwnGuard: monitor state at {path} is unreadable ({e}); "
+                f"starting fresh."
+            ),
+            file=sys.stderr,
+        )
+        return skeleton
+    if not isinstance(data, dict) or "repos" not in data:
+        return skeleton
+    # Belt-and-braces sanitisation: model output was sanitized at parse
+    # time, but the file could have been tampered with offline. Re-run
+    # the same scrub on every string we hand to the renderer.
+    return _sanitize_loaded_state(data)
+
+
+def _sanitize_loaded_state(state: dict) -> dict:
+    """Re-sanitise every model-supplied string in a freshly loaded state."""
+    repos = state.get("repos", {})
+    if not isinstance(repos, dict):
+        state["repos"] = {}
+        return state
+    for entry in repos.values():
+        if not isinstance(entry, dict):
+            continue
+        findings = entry.get("findings") or []
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            for k in ("title", "file", "description", "recommendation",
+                      "cwe", "fix_example", "hunk_context", "anchor"):
+                v = f.get(k)
+                if isinstance(v, str):
+                    f[k] = _sanitize(v)
+    return state
+
+
+def _save_monitor_state(state: dict, path: str) -> None:
+    """Write the monitor cache file with mode 0600.
+
+    chmod is best-effort: on Windows the call is a no-op, on Unix it
+    locks the file to the owner so a multi-user host doesn't leak
+    repo URLs / cached findings to other accounts.
+    """
+    state["version"] = MONITOR_STATE_VERSION
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    if os.name != "nt":
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+    os.replace(tmp_path, path)
+
+
+def _monitor_state_path(config: dict) -> str:
+    """Resolve the monitor state file path from config or default to cwd.
+
+    Default puts state in the current working directory so two parallel
+    runs from different directories never share state. Users wanting a
+    per-user cache can set ``monitor.state_file`` to an absolute path.
+    """
+    monitor_cfg = config.get("monitor", {}) or {}
+    custom = monitor_cfg.get("state_file")
+    if custom:
+        return os.path.expanduser(custom)
+    return os.path.join(os.getcwd(), MONITOR_STATE_FILENAME)
+
+
+# ---------------------------------------------------------------------------
+# Monitor mode: refresh cycle
+# ---------------------------------------------------------------------------
+
+def _audit_commit_for_monitor(
+    repo_url: str,
+    sha: str,
+    config: dict,
+    backend: str,
+) -> AuditResult:
+    """Run the audit pipeline against one commit on a watched repo.
+
+    Slimmer than ``run_scan``: the diff source is always a single
+    commit URL, no CLI args, no spinner (the caller manages user
+    feedback). Returns a fully resolved ``AuditResult`` ready to
+    serialise into monitor state.
+    """
+    commit_url = _build_commit_url(repo_url, sha)
+    raw_diff = fetch_from_url(commit_url)
+    filtered = filter_diff(raw_diff, config, apply_truncation=False)
+    if not filtered.strip():
+        return AuditResult()
+    filtered = _truncate_diff(filtered, config.get("max_diff_lines", 500))
+    response, anchor_table = dispatch_backend(backend, filtered, config)
+    result = parse_response(response)
+    resolve_anchors(result, anchor_table)
+    files = parse_diff_files(filtered)
+    result.files_scanned = len(files)
+    return result
+
+
+def _run_monitor_refresh(
+    config: dict,
+    state: dict,
+    backend: str,
+    progress=None,
+) -> dict:
+    """Iterate the configured monitor repos, audit any new commit.
+
+    First-encounter strategy is "C — reset baseline to HEAD": when a
+    repo has no ``last_audited_sha`` we record the current HEAD and
+    skip the audit. Only commits that land **after** the first
+    refresh produce findings.
+
+    ``progress`` is an optional callback ``(idx, total, name, msg)`` so
+    the TUI can update its status bar while we work. Returns a dict
+    keyed by repo state-key mapping to one of:
+      - ``"first-seen"`` — baseline recorded, no audit run.
+      - ``"unchanged"`` — head matches last_audited_sha, nothing to do.
+      - ``"audited"``   — new commit audited, state updated.
+      - ``"error: ..."`` — recoverable failure (one repo failing must
+        not abort the whole refresh).
+    """
+    monitor_cfg = config.get("monitor", {}) or {}
+    repos = monitor_cfg.get("repos", []) or []
+    summary: dict = {}
+    state.setdefault("repos", {})
+
+    for idx, repo_cfg in enumerate(repos):
+        name = repo_cfg.get("name") or repo_cfg.get("url", "?")
+        url = repo_cfg.get("url")
+        branch = repo_cfg.get("branch")
+        if not url or not branch:
+            summary[name] = "error: monitor entry missing 'url' or 'branch'"
+            continue
+
+        key = _repo_key(url, branch)
+        entry = state["repos"].get(key) or {
+            "name": name,
+            "url": url,
+            "branch": branch,
+            "last_audited_sha": None,
+            "last_viewed_sha": None,
+            "audited_at": None,
+            "findings": [],
+        }
+        # Keep the name in sync with the latest config (the user may
+        # have renamed an entry between runs).
+        entry["name"] = name
+        entry["url"] = url
+        entry["branch"] = branch
+        state["repos"][key] = entry
+
+        if progress:
+            progress(idx + 1, len(repos), name, "fetching commits...")
+
+        try:
+            shas = list_commits_from_url(url, branch, limit=1)
+        except SystemExit as e:
+            summary[key] = f"error: {e.code}"
+            continue
+        if not shas:
+            summary[key] = "error: no commits returned for branch"
+            continue
+
+        latest_sha = shas[0]
+
+        is_first_encounter = entry["last_audited_sha"] is None
+        if not is_first_encounter and entry["last_audited_sha"] == latest_sha:
+            summary[key] = "unchanged"
+            continue
+
+        # First encounter OR new commit -> audit the head. The first
+        # encounter case used to skip the audit and just record HEAD
+        # as a "baseline," but that left the dashboard showing
+        # "clean" for unaudited rows. Now the head always gets one
+        # LLM call when a repo is first seen, so the user gets
+        # current-state findings immediately on the first [r] press.
+        if progress:
+            label = "first audit" if is_first_encounter else "auditing"
+            progress(
+                idx + 1, len(repos), name,
+                f"{label} {latest_sha[:7]}...",
+            )
+        try:
+            result = _audit_commit_for_monitor(url, latest_sha, config, backend)
+        except SystemExit as e:
+            summary[key] = f"error: {e.code}"
+            continue
+
+        entry["last_audited_sha"] = latest_sha
+        entry["audited_at"] = datetime.now(timezone.utc).isoformat()
+        entry["findings"] = [asdict(f) for f in result.findings]
+        # First encounter is "you're looking at it now" - don't fire
+        # the [updated] chip until the NEXT commit lands. Subsequent
+        # audits leave last_viewed_sha alone so the chip surfaces
+        # background changes the user hasn't acknowledged yet.
+        if is_first_encounter:
+            entry["last_viewed_sha"] = latest_sha
+        summary[key] = "audited"
+
+    return summary
+
+
 def _run_self_test() -> int:
     """Run the bundled pytest suite against tests/ and return its exit code.
 
@@ -3917,6 +4798,17 @@ def main():
             "(pip install --user -r requirements-dev.txt)."
         ),
     )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help=(
+            "Open the monitor TUI: a dashboard that watches the repos "
+            "configured under monitor.repos[] in pwnguard.yaml, audits "
+            "newly-landed commits (one per refresh per repo), and lets "
+            "you step through findings without re-running the audit. "
+            "Press [r] inside the TUI to refresh."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -3997,6 +4889,15 @@ def main():
     # Opt-in observations block. Default off so the standard hook flow
     # stays silent on success and findings never get diluted.
     set_show_observations(args.show_observations)
+
+    # Monitor mode: dashboard over the configured monitor.repos[]. Opens
+    # the TUI immediately on cached state; [r] inside the TUI refreshes.
+    # Short-circuits the normal scan path entirely - no diff source, no
+    # threshold gating, no exit code beyond TUI quit.
+    if args.monitor:
+        state_path = _monitor_state_path(config)
+        interactive_monitor(config, backend, state_path)
+        sys.exit(0)
 
     # Dry-run: build the diff and report what would be sent, then exit.
     if args.dry_run:
