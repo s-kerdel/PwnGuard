@@ -30,30 +30,55 @@ def captured(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_gitlab_url_routes_to_repository_commits(captured, monkeypatch):
-    captured["response"] = json.dumps([{"id": "abc1234"}]).encode()
+    captured["response"] = json.dumps([{
+        "id": "abc1234",
+        "committed_date": "2026-05-14T09:00:00.000+00:00",
+    }]).encode()
     monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
 
-    shas = audit.list_commits_from_url(
+    commits = audit.list_commits_from_url(
         "https://gitlab.com/group/project", "main", limit=1,
     )
 
-    assert shas == ["abc1234"]
+    assert commits == [("abc1234", "2026-05-14T09:00:00.000+00:00")]
     assert "/repository/commits" in captured["url"]
     assert "ref_name=main" in captured["url"]
     assert "per_page=1" in captured["url"]
 
 
-def test_github_url_routes_to_commits_endpoint(captured):
-    captured["response"] = json.dumps([{"sha": "deadbeef"}]).encode()
+def test_gitlab_commit_without_date_returns_none(captured, monkeypatch):
+    """Older GitLab versions / unusual responses may omit
+    ``committed_date``. The shape stays a tuple; date slot is None."""
+    captured["response"] = json.dumps([{"id": "abc1234"}]).encode()
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
+    commits = audit.list_commits_from_url("https://gitlab.com/g/p", "main")
+    assert commits == [("abc1234", None)]
 
-    shas = audit.list_commits_from_url(
+
+def test_github_url_routes_to_commits_endpoint(captured):
+    captured["response"] = json.dumps([{
+        "sha": "deadbeef",
+        "commit": {"committer": {"date": "2026-05-14T09:00:00Z"}},
+    }]).encode()
+
+    commits = audit.list_commits_from_url(
         "https://github.com/owner/repo", "main", limit=1,
     )
 
-    assert shas == ["deadbeef"]
+    assert commits == [("deadbeef", "2026-05-14T09:00:00Z")]
     assert "api.github.com" in captured["url"]
     assert "/commits" in captured["url"]
     assert "sha=main" in captured["url"]
+
+
+def test_github_commit_without_committer_date_returns_none(captured):
+    """Some GitHub responses lack ``commit.committer.date`` (rare,
+    but defensive). Tuple shape preserved; date slot is None."""
+    captured["response"] = json.dumps([{"sha": "deadbeef"}]).encode()
+    commits = audit.list_commits_from_url(
+        "https://github.com/o/r", "main",
+    )
+    assert commits == [("deadbeef", None)]
 
 
 @pytest.mark.parametrize("url", [
@@ -64,8 +89,8 @@ def test_self_hosted_gitlab_recognised_by_hostname(captured, monkeypatch, url):
     """Any hostname containing 'gitlab' routes to the GitLab fetcher."""
     captured["response"] = json.dumps([{"id": "abc"}]).encode()
     monkeypatch.setenv("GITLAB_TOKEN", "glpat")
-    shas = audit.list_commits_from_url(url, "main")
-    assert shas == ["abc"]
+    commits = audit.list_commits_from_url(url, "main")
+    assert commits == [("abc", None)]
     assert "/api/v4/projects/" in captured["url"]
 
 

@@ -90,6 +90,70 @@ def test_gitlab_standalone_commit_routes_to_commit_endpoint(captured, monkeypatc
     assert "/commits/deadbeef/diff" in captured["url"]
 
 
+def test_gitlab_commit_reassembly_synthesises_missing_file_headers(captured, monkeypatch):
+    """GitLab's commit-diff API returns each file's ``diff`` body
+    starting at ``@@`` - the ``--- a/X`` / ``+++ b/X`` lines are stripped
+    and the paths live in separate JSON fields. The reassembly MUST
+    put those header lines back; without them ``wrap_diff`` builds
+    an empty anchor table and every model finding gets dropped as
+    "unrecognised anchor". This is the bug that made monitor audits
+    against GitLab commits look like silent zero-finding successes."""
+    captured["response"] = json.dumps([{
+        "old_path": "src/foo.py",
+        "new_path": "src/foo.py",
+        "diff": "@@ -1,1 +1,2 @@\n import os\n+import sys\n",
+    }]).encode()
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
+
+    diff = audit.fetch_from_url(
+        "https://gitlab.com/group/project/-/commit/abcd1234"
+    )
+
+    # All three header lines must be present so wrap_diff can attribute
+    # content lines to src/foo.py.
+    assert "diff --git a/src/foo.py b/src/foo.py" in diff
+    assert "--- a/src/foo.py" in diff
+    assert "+++ b/src/foo.py" in diff
+    # And wrap_diff against the reassembled output must populate the
+    # anchor table for the file (not silently produce an empty one).
+    _, anchors = audit.wrap_diff(diff)
+    assert anchors, "anchor table should not be empty after reassembly"
+    assert any(m["file"] == "src/foo.py" for m in anchors.values())
+
+
+def test_gitlab_commit_reassembly_handles_new_file(captured, monkeypatch):
+    """New-file commits get ``--- /dev/null`` for the source header."""
+    captured["response"] = json.dumps([{
+        "old_path": "src/new.py",
+        "new_path": "src/new.py",
+        "new_file": True,
+        "diff": "@@ -0,0 +1,2 @@\n+import os\n+print(os)\n",
+    }]).encode()
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
+    diff = audit.fetch_from_url(
+        "https://gitlab.com/g/p/-/commit/abcd1234"
+    )
+    assert "--- /dev/null" in diff
+    assert "+++ b/src/new.py" in diff
+
+
+def test_gitlab_commit_reassembly_passes_through_when_headers_present(captured, monkeypatch):
+    """Some self-hosted GitLab versions include the file headers
+    already. The reassembly must NOT double-emit them."""
+    captured["response"] = json.dumps([{
+        "old_path": "src/x.py",
+        "new_path": "src/x.py",
+        "diff": "--- a/src/x.py\n+++ b/src/x.py\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+    }]).encode()
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
+    diff = audit.fetch_from_url(
+        "https://gitlab.com/g/p/-/commit/abcd1234"
+    )
+    # Exactly one occurrence of each header line.
+    assert diff.count("--- a/src/x.py") == 1
+    assert diff.count("+++ b/src/x.py") == 1
+
+
 def test_github_pr_routes_to_pulls_endpoint(captured):
     captured["response"] = _RAW_DIFF
 

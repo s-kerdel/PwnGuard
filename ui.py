@@ -7,6 +7,7 @@ output mode) only has to touch this one file. audit.py never emits raw
 ANSI codes; it calls helpers like ``ui.bold`` / ``ui.severity_color``.
 """
 
+import contextlib
 import os
 import re
 import select
@@ -327,6 +328,31 @@ class CbreakTerminal:
             # of __enter__ so we don't briefly show the cursor in the alt
             # buffer before the buffer switch.
             sys.stdout.write("\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
+
+    @contextlib.contextmanager
+    def paused(self):
+        """Temporarily drop out of cbreak / alt-buffer / hidden-cursor mode.
+
+        Used when a TUI handler needs to emit streaming output that the
+        user should see scrollback-style (e.g. the model's live token
+        stream during a --debug refresh). On enter: restore the saved
+        terminal state, leave the alternate screen buffer, show the
+        cursor - so the user is back at their normal shell. On exit:
+        re-enter cbreak + alt buffer + hide cursor, putting the TUI
+        right back where it was.
+        """
+        import tty
+        # Restore pre-TUI state.
+        self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old)
+        sys.stdout.write("\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+        try:
+            yield
+        finally:
+            # Re-enter the TUI. Same sequence as __enter__.
+            tty.setcbreak(self._fd)
+            sys.stdout.write("\x1b[?1049h\x1b[?25l")
             sys.stdout.flush()
 
 

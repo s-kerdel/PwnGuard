@@ -4,6 +4,10 @@ In v0.1.2 the default ``print_terminal`` layout boxed cards overran
 the terminal by exactly ``len(outer_indent)`` columns (two) because
 the overhead math missed the outer indent. These tests guard the fix
 across realistic terminal widths.
+
+Also covers ``_truncate_visible``, the ANSI-safe truncate used by
+``_boxed`` to prevent over-wide metadata / code lines from pushing
+the right border past the terminal edge.
 """
 import contextlib
 import io
@@ -11,6 +15,47 @@ import io
 import pytest
 
 import audit
+
+
+# ---------------------------------------------------------------------------
+# _truncate_visible: ANSI-safe width clamp
+# ---------------------------------------------------------------------------
+
+def test_truncate_visible_passes_short_input_through():
+    assert audit._truncate_visible("short", 20) == "short"
+
+
+def test_truncate_visible_clamps_plain_text():
+    out = audit._truncate_visible("abcdefghij", 5)
+    assert audit.ui.visible_len(out) <= 5
+    assert out.startswith("abcd")
+
+
+def test_truncate_visible_preserves_ansi_sequences_intact():
+    """The cut must NEVER fall in the middle of an ANSI escape -
+    that would leave the terminal in a half-set color state."""
+    coloured = "\x1b[36mABCDEFGHIJKL\x1b[0m"
+    out = audit._truncate_visible(coloured, 5)
+    # Visible width respected.
+    assert audit.ui.visible_len(out) <= 5
+    # Opening escape kept whole (not cut mid-bytes).
+    assert "\x1b[36m" in out
+    # Reset appended so colour doesn't bleed into following output.
+    assert out.endswith("\x1b[0m")
+
+
+def test_truncate_visible_handles_osc8_hyperlink():
+    """OSC 8 hyperlink sequences (used for clickable CWE links) must
+    also stay intact across the truncate."""
+    linked = "\x1b]8;;https://x\x1b\\CWE-89\x1b]8;;\x1b\\ trailing tail goes away"
+    out = audit._truncate_visible(linked, 8)
+    assert audit.ui.visible_len(out) <= 8
+    # The hyperlink opener escape stays intact.
+    assert "\x1b]8;;https://x\x1b\\" in out
+
+
+def test_truncate_visible_zero_width_returns_empty():
+    assert audit._truncate_visible("anything", 0) == ""
 
 
 # Realistic terminal widths. Width <80 is not tested because at narrow

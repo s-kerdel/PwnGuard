@@ -50,7 +50,7 @@ from typing import Optional
 # Local sibling module; works because Python prepends script dir to sys.path.
 import ui
 
-__version__ = "0.2.0"  # PoC; bump when behaviour or config schema changes.
+__version__ = "0.2.1"  # PoC; bump when behaviour or config schema changes.
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1057,7 +1057,25 @@ def _gitlab_commit_diff(parsed: urllib.parse.ParseResult, project_path: str, sha
         diff_body = change.get("diff", "")
         if not diff_body:
             continue
-        chunks.append(f"diff --git a/{old_path} b/{new_path}\n{diff_body}")
+        # GitLab's commit-diff API strips the ``--- a/X`` and
+        # ``+++ b/X`` header lines; the body starts at ``@@``. Without
+        # ``+++ b/`` the anchor tagger has no file context, so
+        # reconstruct the missing headers here.
+        if diff_body.lstrip("\n").startswith("@@"):
+            if change.get("new_file"):
+                header_lines = f"--- /dev/null\n+++ b/{new_path}\n"
+            elif change.get("deleted_file"):
+                header_lines = f"--- a/{old_path}\n+++ /dev/null\n"
+            else:
+                header_lines = f"--- a/{old_path}\n+++ b/{new_path}\n"
+        else:
+            # Older / self-hosted GitLab versions occasionally include
+            # the headers already - pass through unchanged.
+            header_lines = ""
+        chunks.append(
+            f"diff --git a/{old_path} b/{new_path}\n"
+            f"{header_lines}{diff_body}"
+        )
     return "\n".join(chunks)
 
 
@@ -1133,12 +1151,50 @@ def _fetch_github_commit(parsed: urllib.parse.ParseResult) -> str:
     return _http_get(api_url, headers).decode("utf-8", errors="replace")
 
 
+def _format_relative_time(iso_date: Optional[str]) -> str:
+    """Render an ISO 8601 timestamp as a short ``Nd``-style relative
+    string for the monitor dashboard.
+
+    Granularities: ``Ns`` < 1min, ``Nm`` < 1h, ``Nh`` < 1d, ``Nd`` < 1w,
+    ``Nw`` < 1mo, ``Nmo`` < 1y, then ``YYYY-MM-DD``. Returns an empty
+    string on parse failure so missing or malformed dates render as
+    no chip at all.
+    """
+    if not iso_date:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        return "0s"  # clock skew - treat as "just now"
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    days = seconds // 86400
+    if days < 7:
+        return f"{days}d"
+    if days < 30:
+        return f"{days // 7}w"
+    if days < 365:
+        return f"{days // 30}mo"
+    return dt.strftime("%Y-%m-%d")
+
+
 def _list_gitlab_commits(
     parsed: urllib.parse.ParseResult,
     branch: str,
     limit: int = 1,
 ) -> list:
-    """Return up to ``limit`` most-recent commit SHAs on ``branch``.
+    """Return up to ``limit`` most-recent commits on ``branch`` as
+    ``(sha, committed_date_iso_or_None)`` tuples, newest first.
 
     URL shape is ``https://<host>/<group>/<project>`` - the repo root,
     no /-/<thing> suffix. The function tolerates a trailing slash and
@@ -1167,7 +1223,12 @@ def _list_gitlab_commits(
         sys.exit(f"GitLab returned non-JSON for commit list: {e}")
     if not isinstance(data, list):
         sys.exit(f"GitLab commit list: expected array, got {type(data).__name__}")
-    return [item["id"] for item in data if isinstance(item, dict) and "id" in item]
+    out = []
+    for item in data:
+        if not isinstance(item, dict) or "id" not in item:
+            continue
+        out.append((item["id"], item.get("committed_date")))
+    return out
 
 
 def _list_github_commits(
@@ -1175,10 +1236,11 @@ def _list_github_commits(
     branch: str,
     limit: int = 1,
 ) -> list:
-    """Return up to ``limit`` most-recent commit SHAs on ``branch``.
+    """Return up to ``limit`` most-recent commits on ``branch`` as
+    ``(sha, committer_date_iso_or_None)`` tuples, newest first.
 
     URL shape is ``https://github.com/<owner>/<repo>`` (or the GitHub
-    Enterprise equivalent under ``/api/v3``). Newest first.
+    Enterprise equivalent under ``/api/v3``).
     """
     parts = parsed.path.strip("/").split("/")
     if len(parts) < 2:
@@ -1206,7 +1268,14 @@ def _list_github_commits(
         sys.exit(f"GitHub returned non-JSON for commit list: {e}")
     if not isinstance(data, list):
         sys.exit(f"GitHub commit list: expected array, got {type(data).__name__}")
-    return [item["sha"] for item in data if isinstance(item, dict) and "sha" in item]
+    out = []
+    for item in data:
+        if not isinstance(item, dict) or "sha" not in item:
+            continue
+        commit = item.get("commit") or {}
+        committer = commit.get("committer") or {}
+        out.append((item["sha"], committer.get("date")))
+    return out
 
 
 def _build_commit_url(repo_url: str, sha: str) -> str:
@@ -1234,10 +1303,12 @@ def _build_commit_url(repo_url: str, sha: str) -> str:
 def list_commits_from_url(url: str, branch: str, limit: int = 1) -> list:
     """Dispatch list-commits to the right platform based on URL host.
 
-    Hostname heuristic: substring "gitlab" -> GitLab, "github" -> GitHub.
-    Covers gitlab.com / github.com plus common self-hosted naming
-    (gitlab.example.com, github.internal). Custom-domain self-hosted
-    installs would need a ``platform:`` config knob - deferred.
+    Returns a list of ``(sha, committed_date_iso_or_None)`` tuples,
+    newest first. Hostname heuristic: substring "gitlab" -> GitLab,
+    "github" -> GitHub. Covers gitlab.com / github.com plus common
+    self-hosted naming (gitlab.example.com, github.internal).
+    Custom-domain self-hosted installs would need a ``platform:``
+    config knob - deferred.
     """
     parsed = urllib.parse.urlparse(url)
     if not parsed.scheme or not parsed.netloc:
@@ -2392,6 +2463,23 @@ def parse_response(response: str) -> AuditResult:
                     )
                     return result
 
+    # Schema-mismatch guard: the response parsed as valid JSON but
+    # doesn't have a ``findings`` key. Common when a smaller / safety-
+    # tuned model treats the prompt as chat - e.g. responds with
+    # ``{"response": "I can't help with that"}`` or
+    # ``{"response": "The code looks fine"}``. Without this check the
+    # missing-key path silently degrades to ``findings=[]`` and the
+    # downstream UI shows a clean repo, hiding the fact that no real
+    # audit happened. Treat as an error so the caller surfaces it.
+    if not isinstance(data, dict) or "findings" not in data:
+        result.error = (
+            "AI response is valid JSON but lacks a 'findings' field "
+            "(model likely treated the prompt as chat instead of an "
+            "audit task).\n"
+            f"Raw response:\n{_sanitize(response[:500])}"
+        )
+        return result
+
     for item in data.get("findings", []):
         # Validate severity / confidence; fall back to safe defaults.
         severity = item.get("severity", "INFO").upper()
@@ -2563,6 +2651,37 @@ def _truncate(text: str, max_width: int) -> str:
     return text[: max(0, max_width - 1)] + "…"
 
 
+def _truncate_visible(text: str, max_width: int) -> str:
+    """ANSI-safe truncate: clamp ``text`` to ``max_width`` visible cells
+    without cutting an escape sequence mid-way.
+
+    Walks the string treating each ANSI CSI / OSC 8 match as zero-width.
+    Once the visible budget is exhausted, appends ``…\\x1b[0m`` so any
+    open color state is reset on the truncated cell.
+    """
+    if max_width <= 0:
+        return ""
+    if ui.visible_len(text) <= max_width:
+        return text
+    visible = 0
+    out: list = []
+    i = 0
+    n = len(text)
+    while i < n:
+        m = ui._ANSI_RE.match(text, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        if visible >= max_width - 1:
+            out.append("…\x1b[0m")
+            return "".join(out)
+        out.append(text[i])
+        visible += 1
+        i += 1
+    return "".join(out)
+
+
 def _severity_marker(severity: str) -> str:
     """Badge at the start of a finding's title row.
 
@@ -2687,7 +2806,8 @@ def _render_diff_lines(
     overhead = 2 + 1 + ln_width + 2
     max_content = max(20, available - overhead)
     for lineno, content in collected:
-        text = _truncate(_sanitize(content), max_content)
+        # Expand tabs so visible_len matches the rendered column width.
+        text = _truncate(_sanitize(content).expandtabs(4), max_content)
         ln_str = str(lineno).rjust(ln_width)
         is_target = (
             target_line is not None and lineno == target_line and _highlight_target_line
@@ -2843,7 +2963,7 @@ def _print_fix_example(f: Finding, available: int, indent: str) -> None:
     # Overhead: 2-char prefix + 1 space.
     max_content = max(20, available - 3)
     for line in lines:
-        text = _truncate(_sanitize(line), max_content)
+        text = _truncate(_sanitize(line).expandtabs(4), max_content)
         print(f"{indent}{ui.green('+')} {ui.green(text)}")
 
 
@@ -2854,6 +2974,7 @@ def _render_finding_card(
     width: int,
     outer_indent: str,
     nav_prefix: str = "",
+    active: bool = False,
 ) -> None:
     """Render one finding's full card: title row + body, optionally boxed.
 
@@ -2861,7 +2982,9 @@ def _render_finding_card(
     TUI's expanded row. ``outer_indent`` is the left-margin string each
     output line gets. ``nav_prefix`` is an optional cursor/checkbox
     string that sits to the left of the box's top border (review TUI
-    only); pass an empty string for the default layout.
+    only); pass an empty string for the default layout. ``active=True``
+    paints the outer border in cyan so the user can pick the currently
+    focused card out of a column of expanded ones at a glance.
 
     When ``_use_finding_card`` is False the card renders flat: same
     content, no enclosing frame. Flip the flag near the top of this
@@ -2872,12 +2995,11 @@ def _render_finding_card(
     # left padding; the flat fallback prepends the outer indent itself.
     boxed = _use_finding_card
     # Box overhead is: outer_indent + nav padding + 2 border chars +
-    # 2 inner pad spaces = len(outer_indent) + nav_w + 4. The flat
-    # fallback just consumes the outer indent. Without the
-    # ``len(outer_indent)`` term the boxed cards overran by exactly the
-    # indent in the default print_terminal path (outer_indent="  "),
-    # wrapping the right border onto the next line.
-    overhead = (4 + nav_w + len(outer_indent)) if boxed else len(outer_indent)
+    # 2 inner pad spaces + 1 right-edge margin. The right-edge margin
+    # keeps the closing ``│`` at column ``width - 1`` instead of
+    # column ``width``; without it some terminal emulators auto-wrap
+    # the last column or count a scrollbar against usable width.
+    overhead = (4 + nav_w + len(outer_indent) + 1) if boxed else len(outer_indent)
     inner_w = max(20, width - overhead)
 
     # Capture: code window + Description/Suggestion table + Example.
@@ -2941,12 +3063,20 @@ def _render_finding_card(
     # Boxed: frame each captured line with `│ ... │` and add top + bot
     # borders. Nav prefix (if any) sits to the left of the top border;
     # subsequent lines indent under it.
-    bar = ui.dim("│")
-    top = ui.dim("┌" + ("─" * (inner_w + 2)) + "┐")
-    bot = ui.dim("└" + ("─" * (inner_w + 2)) + "┘")
+    border_style = ui.cyan if active else ui.dim
+    bar = border_style("│")
+    top = border_style("┌" + ("─" * (inner_w + 2)) + "┐")
+    bot = border_style("└" + ("─" * (inner_w + 2)) + "┘")
     box_indent = outer_indent + (" " * nav_w) if nav_prefix else outer_indent
 
     def _boxed(line: str) -> None:
+        # Tab expansion keeps visible_len aligned with rendered width;
+        # ANSI-safe truncation prevents a too-wide line (deep file
+        # path in metadata, long quoted code) from pushing the right
+        # border past the terminal edge.
+        line = line.expandtabs(4)
+        if ui.visible_len(line) > inner_w:
+            line = _truncate_visible(line, inner_w)
         vw = ui.visible_len(line)
         pad = max(0, inner_w - vw)
         print(f"{box_indent}{bar} {line}{' ' * pad} {bar}")
@@ -3276,7 +3406,7 @@ def _render_review_row(
     outside the box (they're nav state, not finding content); the
     severity badge, title, file:line, CWE and body all live inside.
     """
-    cursor_mark = ui.bold(">") if is_current else " "
+    cursor_mark = ui.bold(ui.cyan("❯")) if is_current else " "
     check = "[x]" if checked else "[ ]"
     badge = _severity_marker(f.severity)
 
@@ -3308,6 +3438,7 @@ def _render_review_row(
         width=width,
         outer_indent="",
         nav_prefix=nav_prefix,
+        active=is_current,
     )
 
 
@@ -3335,10 +3466,34 @@ def _render_review(
     / ``↓ N hidden`` indicators in place of the clipped rows. Keeps
     the cursor row (and its expansion, if any) visible no matter how
     small the terminal is.
+
+    Output is buffered and emitted by ``_emit_tui_frame`` so the
+    terminal repaints in one pass (no clear-then-fill flicker on
+    keystrokes).
     """
-    ui.clear_screen()
     width = ui.term_width()
     height = ui.term_height()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _render_review_into_buffer(
+            findings, checked, expanded, cursor, diff_lines,
+            observations, width, height,
+        )
+    _emit_tui_frame(buf.getvalue())
+
+
+def _render_review_into_buffer(
+    findings: list,
+    checked: list,
+    expanded: list,
+    cursor: int,
+    diff_lines: dict,
+    observations: list,
+    width: int,
+    height: int,
+) -> None:
+    """Inner render body. ``sys.stdout`` is redirected to the frame
+    buffer by ``_render_review``; this function just emits lines."""
     n = len(findings)
     marked = sum(checked)
 
@@ -3347,7 +3502,7 @@ def _render_review(
     # the findings region is what shrinks when space is tight.
     header_lines = [
         ui.bold("PwnGuard review") + ui.dim(f"  ·  {n} finding{'s' if n != 1 else ''}"),
-        ui.dim("  up/down navigate   right/left expand/collapse   space=mark   q=quit"),
+        ui.dim("  up/down navigate   enter toggle   -/= collapse/expand all   space=mark   q=quit"),
     ]
     header_lines += _capture(_print_legend)
     header_lines.append("")  # blank after legend
@@ -3422,7 +3577,6 @@ def _render_review(
         print(line)
     for line in footer_lines:
         print(line)
-    sys.stdout.flush()
 
 
 def interactive_review(
@@ -3434,8 +3588,11 @@ def interactive_review(
 
     Keys:
       up / down               navigate
+      enter                   toggle expand / collapse on the current row
       right                   expand current finding
       left                    collapse current finding
+      -                       collapse everything
+      =                       expand everything
       space, x                toggle marked indicator
       q, esc, Ctrl-C          quit
     """
@@ -3470,10 +3627,16 @@ def interactive_review(
                 cursor = (cursor - 1) % n
             elif key == "down":
                 cursor = (cursor + 1) % n
+            elif key == "enter":
+                expanded[cursor] = not expanded[cursor]
             elif key == "right":
                 expanded[cursor] = True
             elif key == "left":
                 expanded[cursor] = False
+            elif key == "-":
+                expanded = [False] * n
+            elif key == "=":
+                expanded = [True] * n
             elif key in ("space", "x"):
                 checked[cursor] = not checked[cursor]
 
@@ -3499,6 +3662,24 @@ def _finding_from_state_dict(d: dict) -> Finding:
     return Finding(**cleaned)
 
 
+def _severity_breakdown(findings: list) -> str:
+    """Compact ``N S`` summary across the severity ladder, joined with
+    ``·``. Each ``N S`` cell is coloured by severity so a CRITICAL
+    cluster reads red, an INFO cluster reads dim. Empty severities are
+    skipped (no "0 L" noise)."""
+    counts: dict = {}
+    for f in findings:
+        sev = (f.get("severity") or "INFO").upper()
+        counts[sev] = counts.get(sev, 0) + 1
+    parts = []
+    for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        if sev not in counts:
+            continue
+        letter = SEVERITY_LETTER.get(sev, "?")
+        parts.append(ui.severity_color(f"{counts[sev]} {letter}", sev))
+    return "  " + "  ·  ".join(parts) if parts else ""
+
+
 def _render_monitor_row(
     entry: dict,
     *,
@@ -3514,25 +3695,32 @@ def _render_monitor_row(
     name = entry.get("name") or entry.get("url") or "?"
     sha = entry.get("last_audited_sha")
     last_viewed = entry.get("last_viewed_sha")
+    commit_date = entry.get("last_audited_commit_date")
     findings = entry.get("findings") or []
-    n = len(findings)
     audited = sha is not None
     updated = audited and (sha != last_viewed)
 
-    cursor_mark = ui.bold(">") if is_current else " "
+    cursor_mark = ui.bold(ui.cyan("❯")) if is_current else " "
     arrow = "▼" if is_expanded else "▶"
     name_styled = ui.bold(name) if is_current else name
     if not audited:
         count_text = ui.dim("  awaiting first refresh")
-    elif n:
-        count_text = ui.dim(f"  {n} finding{'s' if n != 1 else ''}")
+    elif findings:
+        # Severity breakdown, e.g. "1 C  ·  3 H  ·  12 INFO". Replaces
+        # the previous flat "N findings" count so the user can see at
+        # a glance which repo needs attention without expanding it.
+        count_text = _severity_breakdown(findings)
     else:
         count_text = ui.dim("  clean")
     left = f" {cursor_mark} {arrow}  {name_styled}{count_text}"
 
     short = _format_short_sha(sha)
+    relative = _format_relative_time(commit_date)
     chip = ui.dim("[updated]") if updated else ""
-    right_parts = [ui.dim(short)]
+    right_parts = []
+    if relative:
+        right_parts.append(ui.dim(relative))
+    right_parts.append(ui.dim(short))
     if chip:
         right_parts.append(chip)
     right = "  ".join(right_parts)
@@ -3558,19 +3746,20 @@ def _render_monitor_finding_row(
     is_expanded: bool,
     is_current: bool,
     width: int,
+    diff_lines: Optional[dict] = None,
 ) -> None:
     """Print a finding row inside the monitor dashboard.
 
     Indented one column under the repo header. Collapsed form shows
     severity badge + title + right-aligned file:line / CWE. Expanded
     form uses the shared finding-card helper so the full description,
-    suggestion, and fix_example render the same way they do in
-    ``--review``. ``diff_lines`` is empty here because monitor doesn't
-    cache the underlying diff - the card falls back to a
-    "(no code preview)" placeholder where ``--review`` would show
-    the ±3 line window.
+    suggestion, fix_example, AND the ±3 line code preview render the
+    same way they do in ``--review``. ``diff_lines`` is the cached
+    per-commit mapping the monitor state file persists alongside
+    findings; when missing or empty the card falls back to a
+    placeholder, same as --review would.
     """
-    cursor_mark = ui.bold(">") if is_current else " "
+    cursor_mark = ui.bold(ui.cyan("❯")) if is_current else " "
     badge = _severity_marker(f.severity)
     if is_current:
         title_text = ui.bold(ui.severity_color(f.title, f.severity))
@@ -3594,10 +3783,13 @@ def _render_monitor_finding_row(
 
     # Expanded: reuse the boxed-card helper from --review. The cursor
     # mark sits to the left of the box's top corner via nav_prefix;
-    # subsequent lines indent under it.
+    # subsequent lines indent under it. ``diff_lines`` comes from the
+    # repo's cached audit and feeds the ±3 code preview window.
     nav_prefix = f"   {cursor_mark}  "
     _render_finding_card(
-        f, {}, width=width, outer_indent="", nav_prefix=nav_prefix,
+        f, diff_lines or {}, width=width,
+        outer_indent="", nav_prefix=nav_prefix,
+        active=is_current,
     )
 
 
@@ -3612,6 +3804,12 @@ def _build_monitor_items(
     either ``"repo"`` (then ``finding_idx`` is None) or ``"finding"``.
     Findings only appear when their repo is expanded - collapsing a
     repo removes its findings from the cursor reachable set.
+
+    Within an expanded repo, findings are ordered by severity
+    (CRITICAL -> HIGH -> MEDIUM -> LOW -> INFO) with stable secondary
+    ordering by emission index. Matches --review's behaviour so a
+    HIGH SQL-injection finding doesn't sit buried under fifteen
+    INFO "type ignore comment" rows.
     """
     items = []
     for key in keys:
@@ -3619,9 +3817,30 @@ def _build_monitor_items(
         if repo_expanded.get(key, False):
             entry = state.get("repos", {}).get(key) or {}
             findings = entry.get("findings") or []
-            for i in range(len(findings)):
+            sorted_idx = sorted(
+                range(len(findings)),
+                key=lambda i: (
+                    -SEVERITY_ORDER.get(
+                        (findings[i].get("severity") or "INFO").upper(), 0,
+                    ),
+                    i,  # stable: preserve emission order within severity
+                ),
+            )
+            for i in sorted_idx:
                 items.append(("finding", key, i))
     return items
+
+
+def _emit_tui_frame(content: str) -> None:
+    """Write a pre-built TUI frame in one terminal call.
+
+    Cursor home + per-line EOL clear + final EOS clear avoids the
+    blank-then-paint flash that a naive ``clear_screen``-then-print
+    loop produces on every keystroke.
+    """
+    frame = "\x1b[H" + content.replace("\n", "\x1b[K\n") + "\x1b[J"
+    sys.stdout.write(frame)
+    sys.stdout.flush()
 
 
 def _render_monitor(
@@ -3636,11 +3855,35 @@ def _render_monitor(
     """Full-screen redraw of the monitor dashboard.
 
     ``items`` is the flat (repo + finding) list the cursor indexes
-    into; ``keys`` is just the repo subset used for header counts.
+    into; ``keys`` is the repo subset used for the header count.
+    Output is buffered and emitted by ``_emit_tui_frame`` so the
+    terminal repaints in one pass.
     """
-    ui.clear_screen()
     width = ui.term_width()
     height = ui.term_height()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _render_monitor_into_buffer(
+            state, keys, items, cursor,
+            repo_expanded, finding_expanded, status_line,
+            width, height,
+        )
+    _emit_tui_frame(buf.getvalue())
+
+
+def _render_monitor_into_buffer(
+    state: dict,
+    keys: list,
+    items: list,
+    cursor: int,
+    repo_expanded: dict,
+    finding_expanded: dict,
+    status_line: str,
+    width: int,
+    height: int,
+) -> None:
+    """Inner render body. ``sys.stdout`` is redirected to the frame
+    buffer by ``_render_monitor``; this function just emits lines."""
     n_repos = len(keys)
 
     header_lines = [
@@ -3648,7 +3891,7 @@ def _render_monitor(
             f"  ·  {n_repos} repo{'s' if n_repos != 1 else ''}"
         ),
         ui.dim(
-            "  up/down navigate   enter toggle (or right/left)   "
+            "  up/down navigate   enter toggle   -/= collapse/expand all   "
             "space=mark viewed   r=refresh   q=quit"
         ),
     ]
@@ -3665,7 +3908,6 @@ def _render_monitor(
         ))
         for line in footer_lines:
             print(line)
-        sys.stdout.flush()
         return
 
     # Render each item into a buffer so we can measure for windowing.
@@ -3691,12 +3933,16 @@ def _render_monitor(
                 except (TypeError, KeyError):
                     block = [ui.dim("        (finding malformed)")]
                 else:
+                    diff_lines = _deserialize_diff_lines(
+                        entry.get("diff_lines") or {}
+                    )
                     block = _capture(
                         _render_monitor_finding_row,
                         f,
                         is_expanded=finding_expanded.get((key, idx), False),
                         is_current=(i == cursor),
                         width=width,
+                        diff_lines=diff_lines,
                     )
         item_blocks.append(block)
 
@@ -3748,7 +3994,6 @@ def _render_monitor(
         ))
     for line in footer_lines:
         print(line)
-    sys.stdout.flush()
 
 
 def _summarise_refresh(summary: dict) -> str:
@@ -3799,13 +4044,17 @@ def _ensure_repo_entries(state: dict, config: dict) -> dict:
                 "branch": branch,
                 "last_audited_sha": None,
                 "last_viewed_sha": None,
+                "last_audited_commit_date": None,
                 "audited_at": None,
                 "findings": [],
+                "diff_lines": {},
             }
         else:
             entry["name"] = name
             entry["url"] = url
             entry["branch"] = branch
+            entry.setdefault("diff_lines", {})
+            entry.setdefault("last_audited_commit_date", None)
     return state
 
 
@@ -3838,9 +4087,11 @@ def interactive_monitor(
 
     Keys:
       up / down         navigate
-      enter             toggle expand / collapse on the current repo
-      right             expand current repo (show findings)
+      enter             toggle expand / collapse on the current row
+      right             expand
       left              collapse
+      -                 collapse everything (all repos + all findings)
+      =                 expand everything
       space, x          mark current repo viewed (clears [updated] chip)
       r                 refresh (poll all repos, audit anything new)
       q, esc, Ctrl-C    save state and quit
@@ -3912,7 +4163,7 @@ def interactive_monitor(
     _refresh_items()
 
     try:
-        with ui.CbreakTerminal():
+        with ui.CbreakTerminal() as term:
             while True:
                 _render_monitor(
                     state, keys, items, cursor,
@@ -3967,30 +4218,81 @@ def interactive_monitor(
                             status_line = (
                                 f"marked '{entry.get('name', '?')}' viewed"
                             )
+                elif pressed == "-":
+                    # Collapse everything: all repos closed, every
+                    # finding card closed.
+                    repo_expanded.clear()
+                    finding_expanded.clear()
+                    _refresh_items(prev_anchor=current)
+                    status_line = "collapsed all"
+                elif pressed == "=":
+                    # Expand everything: each repo open with all its
+                    # findings expanded. One-key overview.
+                    for k in keys:
+                        repo_expanded[k] = True
+                    _refresh_items(prev_anchor=current)
+                    for kind_, key_, idx_ in items:
+                        if kind_ == "finding":
+                            finding_expanded[(key_, idx_)] = True
+                    status_line = "expanded all"
                 elif pressed == "r":
-                    status_line = "refreshing..."
-                    _render_monitor(
-                        state, keys, items, cursor,
-                        repo_expanded, finding_expanded, status_line,
-                    )
-
-                    def _progress(i, total, name, msg):
-                        nonlocal status_line
-                        status_line = (
-                            f"refresh {i}/{total} · {name} · {msg}"
-                        )
+                    if _debug_mode:
+                        # Drop out of cbreak / alt-buffer so the user
+                        # can see streaming model output in their
+                        # normal terminal scrollback. The TUI redraws
+                        # automatically when we re-enter at top of
+                        # the while loop.
+                        with term.paused():
+                            print(
+                                "\nPwnGuard Monitor: --debug refresh "
+                                "(streaming below)\n",
+                                file=sys.stderr,
+                            )
+                            try:
+                                summary = _run_monitor_refresh(
+                                    config, state, backend,
+                                )
+                            except SystemExit as e:
+                                summary = {}
+                                print(
+                                    f"\nrefresh aborted: {e.code}",
+                                    file=sys.stderr,
+                                )
+                            print(
+                                "\nPwnGuard Monitor: refresh complete.",
+                                file=sys.stderr,
+                            )
+                            try:
+                                input(
+                                    "Press Enter to return to the "
+                                    "dashboard..."
+                                )
+                            except (EOFError, KeyboardInterrupt):
+                                pass
+                    else:
+                        status_line = "refreshing..."
                         _render_monitor(
                             state, keys, items, cursor,
                             repo_expanded, finding_expanded, status_line,
                         )
 
-                    try:
-                        summary = _run_monitor_refresh(
-                            config, state, backend, progress=_progress,
-                        )
-                    except SystemExit as e:
-                        status_line = f"refresh aborted: {e.code}"
-                        continue
+                        def _progress(i, total, name, msg):
+                            nonlocal status_line
+                            status_line = (
+                                f"refresh {i}/{total} · {name} · {msg}"
+                            )
+                            _render_monitor(
+                                state, keys, items, cursor,
+                                repo_expanded, finding_expanded, status_line,
+                            )
+
+                        try:
+                            summary = _run_monitor_refresh(
+                                config, state, backend, progress=_progress,
+                            )
+                        except SystemExit as e:
+                            status_line = f"refresh aborted: {e.code}"
+                            continue
                     _save_monitor_state(state, state_path)
                     keys = _ordered_monitor_keys(state, config)
                     _refresh_items(prev_anchor=current)
@@ -4410,6 +4712,18 @@ def _sanitize_loaded_state(state: dict) -> dict:
                 v = f.get(k)
                 if isinstance(v, str):
                     f[k] = _sanitize(v)
+        # Cached diff content is straight from the upstream platform,
+        # not from the model - so it's already "untrusted user data"
+        # by the same logic as a live --review run. Scrub it the same
+        # way before it reaches the renderer.
+        cached_diff = entry.get("diff_lines")
+        if isinstance(cached_diff, dict):
+            for lines in cached_diff.values():
+                if not isinstance(lines, dict):
+                    continue
+                for ln_key, content in list(lines.items()):
+                    if isinstance(content, str):
+                        lines[ln_key] = _sanitize(content)
     return state
 
 
@@ -4450,31 +4764,145 @@ def _monitor_state_path(config: dict) -> str:
 # Monitor mode: refresh cycle
 # ---------------------------------------------------------------------------
 
+def _serialize_diff_lines(diff_lines: dict) -> dict:
+    """Convert ``parse_diff_lines`` output to a JSON-safe shape.
+
+    JSON dict keys must be strings, but ``parse_diff_lines`` uses int
+    line numbers. We stringify on the way out and parse back on load.
+    """
+    out: dict = {}
+    for fname, lines in (diff_lines or {}).items():
+        if not isinstance(lines, dict):
+            continue
+        out[fname] = {str(ln): content for ln, content in lines.items()}
+    return out
+
+
+def _deserialize_diff_lines(serialized: dict) -> dict:
+    """Reverse of ``_serialize_diff_lines``: turn string-keyed maps back
+    into int-keyed ones the renderer expects. Silently drops malformed
+    rows so a tampered cache can't crash the TUI.
+    """
+    out: dict = {}
+    if not isinstance(serialized, dict):
+        return out
+    for fname, lines in serialized.items():
+        if not isinstance(lines, dict):
+            continue
+        sub: dict = {}
+        for ln_str, content in lines.items():
+            try:
+                ln = int(ln_str)
+            except (TypeError, ValueError):
+                continue
+            sub[ln] = content if isinstance(content, str) else ""
+        out[fname] = sub
+    return out
+
+
 def _audit_commit_for_monitor(
     repo_url: str,
     sha: str,
     config: dict,
     backend: str,
-) -> AuditResult:
+):
     """Run the audit pipeline against one commit on a watched repo.
 
     Slimmer than ``run_scan``: the diff source is always a single
     commit URL, no CLI args, no spinner (the caller manages user
-    feedback). Returns a fully resolved ``AuditResult`` ready to
-    serialise into monitor state.
+    feedback). Auto-switches to chunked scanning when the prompt
+    would exceed the active backend's context window so big commits
+    don't get silently truncated by the LLM. Returns
+    ``(AuditResult, diff_lines)`` - the diff_lines mapping is cached
+    in monitor state so the TUI can render the ±3 code-preview
+    window for each finding without re-fetching.
+
+    Failure-mode visibility: every audit run prints a one-line
+    diagnostic to stderr when parsing fails or when findings get
+    dropped because the model emitted unknown anchors. Without this
+    the dashboard would just show "clean" for any commit whose
+    prompt overflowed; the user would have no signal that the model
+    in fact found something the host couldn't keep.
     """
     commit_url = _build_commit_url(repo_url, sha)
     raw_diff = fetch_from_url(commit_url)
     filtered = filter_diff(raw_diff, config, apply_truncation=False)
     if not filtered.strip():
-        return AuditResult()
+        return AuditResult(), {}
+
+    # Build diff_lines from the pre-truncation filtered diff. We cache
+    # this alongside findings so the monitor TUI's expanded finding
+    # cards render the same code window --review shows. parse_diff_lines
+    # only stores added lines (not context), matching --review's
+    # behaviour.
+    diff_lines = parse_diff_lines(filtered)
+
+    # Auto-chunk path: Ollama silently truncates prompts that exceed
+    # num_ctx, which produces ghost findings whose anchors don't map
+    # to our wrap_diff table. Mirror the same overflow check
+    # ``run_scan`` does for the local backends and route through
+    # _run_scan_chunked so each file is scanned within budget.
+    overflow = False
+    if backend in ("ollama", "openai-compat"):
+        preview_prompt = build_system_prompt(
+            include_preview_fields=_show_code_preview,
+        )
+        prompt_tokens = (
+            estimate_tokens(preview_prompt) + estimate_tokens(filtered)
+        )
+        backend_cfg = config.get(
+            "ollama" if backend == "ollama" else "openai", {},
+        )
+        num_ctx = backend_cfg.get("num_ctx", 4096) if backend == "ollama" else None
+        num_predict = backend_cfg.get("num_predict", 2048)
+        if num_ctx is not None:
+            budget = prompt_tokens + num_predict
+            if budget > num_ctx:
+                overflow = True
+
+    if overflow:
+        # ``_run_scan_chunked`` takes an ``args`` parameter it doesn't
+        # actually read; pass a sentinel so the call shape stays
+        # identical to run_scan's invocation.
+        class _Args:
+            pass
+        result, _elapsed = _run_scan_chunked(_Args(), config, backend, filtered)
+        if result.error:
+            print(
+                ui.dim(
+                    f"PwnGuard Monitor: parse error during chunked audit: "
+                    f"{result.error.splitlines()[0]}"
+                ),
+                file=sys.stderr,
+            )
+        files = parse_diff_files(filtered)
+        result.files_scanned = len(files)
+        return result, diff_lines
+
     filtered = _truncate_diff(filtered, config.get("max_diff_lines", 500))
     response, anchor_table = dispatch_backend(backend, filtered, config)
     result = parse_response(response)
-    resolve_anchors(result, anchor_table)
+    if result.error:
+        print(
+            ui.dim(
+                f"PwnGuard Monitor: parse error: "
+                f"{result.error.splitlines()[0]}"
+            ),
+            file=sys.stderr,
+        )
+    dropped = resolve_anchors(result, anchor_table)
+    if dropped:
+        print(
+            ui.dim(
+                f"PwnGuard Monitor: dropped {dropped} finding(s) with "
+                f"unrecognised anchor token (model fabricated, or "
+                f"prompt was truncated past num_ctx)"
+            ),
+            file=sys.stderr,
+        )
     files = parse_diff_files(filtered)
     result.files_scanned = len(files)
-    return result
+    return result, diff_lines
 
 
 def _run_monitor_refresh(
@@ -4519,6 +4947,7 @@ def _run_monitor_refresh(
             "branch": branch,
             "last_audited_sha": None,
             "last_viewed_sha": None,
+            "last_audited_commit_date": None,
             "audited_at": None,
             "findings": [],
         }
@@ -4533,15 +4962,25 @@ def _run_monitor_refresh(
             progress(idx + 1, len(repos), name, "fetching commits...")
 
         try:
-            shas = list_commits_from_url(url, branch, limit=1)
+            commits = list_commits_from_url(url, branch, limit=1)
         except SystemExit as e:
             summary[key] = f"error: {e.code}"
             continue
-        if not shas:
+        if not commits:
             summary[key] = "error: no commits returned for branch"
             continue
 
-        latest_sha = shas[0]
+        # list_commits_from_url returns (sha, committed_date_iso) tuples.
+        # The date is informational - render-only - so we tolerate it
+        # being None on backward-compat-flavoured servers that don't
+        # ship it.
+        first = commits[0]
+        if isinstance(first, tuple) and len(first) == 2:
+            latest_sha, latest_commit_date = first
+        else:
+            # Defensive: pre-v0.2.0 internal callers used to return bare
+            # SHAs. Keep working if anyone wires this up differently.
+            latest_sha, latest_commit_date = first, None
 
         is_first_encounter = entry["last_audited_sha"] is None
         if not is_first_encounter and entry["last_audited_sha"] == latest_sha:
@@ -4561,14 +5000,18 @@ def _run_monitor_refresh(
                 f"{label} {latest_sha[:7]}...",
             )
         try:
-            result = _audit_commit_for_monitor(url, latest_sha, config, backend)
+            result, diff_lines = _audit_commit_for_monitor(
+                url, latest_sha, config, backend,
+            )
         except SystemExit as e:
             summary[key] = f"error: {e.code}"
             continue
 
         entry["last_audited_sha"] = latest_sha
+        entry["last_audited_commit_date"] = latest_commit_date
         entry["audited_at"] = datetime.now(timezone.utc).isoformat()
         entry["findings"] = [asdict(f) for f in result.findings]
+        entry["diff_lines"] = _serialize_diff_lines(diff_lines)
         # First encounter is "you're looking at it now" - don't fire
         # the [updated] chip until the NEXT commit lands. Subsequent
         # audits leave last_viewed_sha alone so the chip surfaces

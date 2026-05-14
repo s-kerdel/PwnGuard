@@ -118,6 +118,31 @@ def test_no_json_object_in_response_returns_error():
     assert result.error is not None
 
 
+def test_off_schema_json_response_is_caught_as_error():
+    """Smaller models sometimes treat the prompt as chat and emit
+    `{"response": "I can't help"}` instead of the findings schema.
+    Without explicit detection this would parse as ``findings=[]`` and
+    look like a clean audit. The parser must surface it as an error
+    so the monitor doesn't silently report falsely-clean repos."""
+    refusal = '{"response": "I\'m sorry, but I can\'t assist with that."}'
+    result = audit.parse_response(refusal)
+    assert result.error is not None
+    assert "findings" in result.error.lower()
+    assert result.findings == []
+
+
+def test_off_schema_json_with_prose_response_caught():
+    """Verbose paraphrase responses must also trigger the schema
+    guard, not just short refusals."""
+    prose = (
+        '{"response": "The provided code review does not contain any '
+        'security vulnerabilities or issues."}'
+    )
+    result = audit.parse_response(prose)
+    assert result.error is not None
+    assert result.findings == []
+
+
 # ---------------------------------------------------------------------------
 # JSON repair pipeline
 # ---------------------------------------------------------------------------

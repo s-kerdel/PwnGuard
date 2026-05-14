@@ -1,6 +1,6 @@
 # PwnGuard
 
-> **Status: Proof of Concept (`v0.2.0`).**
+> **Status: Proof of Concept (`v0.2.1`).**
 > PwnGuard is published as a reference / portfolio piece. It works
 > end-to-end, but the config schema, prompt format, and CLI flags may
 > change without notice before a `1.0` release. Don't rely on it as
@@ -618,10 +618,12 @@ self-hosted instances are not yet supported in monitor mode.
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` | Move the cursor between repos |
-| `enter` | Toggle expand / collapse on the current repo |
+| `↑` / `↓` | Move the cursor between repos / findings |
+| `enter` | Toggle expand / collapse on the current row |
 | `→` | Expand (alternative to `enter`) |
 | `←` | Collapse (alternative to `enter`) |
+| `-` | Collapse everything (all repos + all findings) |
+| `=` | Expand everything |
 | `space` | Mark the current repo viewed (clears the `[updated]` chip) |
 | `r` | Refresh (poll all repos via API, audit anything new) |
 | `q` (or `esc`) | Save state and quit |
@@ -649,12 +651,42 @@ model's context window. If a backlog of unscanned commits matters
 for your workflow, this is the knob to revisit in a follow-up
 release.
 
+### Verifying the model is actually running (`--debug`)
+
+`python3 audit.py --monitor --debug` keeps the dashboard, but pressing
+`r` temporarily drops out of the TUI so the backend's live token
+stream prints to your normal terminal (same streaming output you'd
+see from `--debug` on a regular scan). When the refresh finishes you
+press Enter to return to the dashboard. Useful for confirming that
+Ollama (or whichever backend) is actually being called, watching
+prompt processing speed, and spotting truncated / refused responses.
+
 ### The `[updated]` chip
 
 A repo row shows `[updated]` when `last_audited_sha != last_viewed_sha`
 — i.e. PwnGuard has audited a new commit since you last acknowledged
 this repo. Pressing `[space]` while the cursor is on the row sets
 viewed = audited and the chip clears.
+
+### What each repo row shows
+
+Reading left to right:
+
+- Cursor mark (`❯` in bold cyan when the row is the active one)
+- Expand arrow (`▶` collapsed, `▼` expanded)
+- Repo name
+- Severity breakdown — `1 C  ·  3 H  ·  5 M  ·  12 INFO`, coloured per
+  severity, only categories with non-zero counts shown. `clean` when
+  audited with no findings; `awaiting first refresh` before the first
+  audit on a freshly-configured repo
+- Right-aligned: short commit date (`3d`, `2w`, etc.), short SHA, and
+  the `[updated]` chip when there's been an audit since you last
+  pressed `[space]` on this row
+
+Expanding a row reveals its findings as individually-selectable rows;
+expanding an individual finding shows the same boxed card layout
+`--review` uses, including the ±3-line code preview window (diff
+content is cached alongside findings so this is offline).
 
 ### What the state file contains
 
@@ -663,23 +695,30 @@ viewed = audited and the chip clears.
   "version": 1,
   "repos": {
     "https://gitlab.com/group/api-server@main": {
-      "name":             "api-server",
-      "last_audited_sha": "abc1234...",
-      "last_viewed_sha":  "abc1234...",
-      "audited_at":       "2026-05-15T09:14:00+00:00",
-      "findings":         [ /* asdict(Finding) per finding */ ]
+      "name":                       "api-server",
+      "last_audited_sha":           "abc1234...",
+      "last_viewed_sha":            "abc1234...",
+      "last_audited_commit_date":   "2026-05-15T09:00:00+00:00",
+      "audited_at":                 "2026-05-15T09:14:00+00:00",
+      "findings":                   [ /* asdict(Finding) per finding */ ],
+      "diff_lines":                 { "src/users.py": { "42": "..." } }
     }
   }
 }
 ```
 
 The file is JSON (never `pickle` — that would be unsafe to load
-from disk). Findings are re-sanitized on load as belt-and-braces
-against an offline-tampered cache; even a hand-edited state file
-can't smuggle ANSI escapes into the renderer. Tokens are read from
-env vars only and **never** persisted.
+from disk). Findings and cached diff lines are re-sanitised on load
+as belt-and-braces against an offline-tampered cache; even a
+hand-edited state file cannot smuggle ANSI escapes into the renderer.
+Tokens are read from env vars only and **never** persisted.
 
-### Limits of the first cut
+`diff_lines` is the per-commit code cache the TUI uses to draw the
+±3-line preview window without re-fetching. Size is bounded by the
+commit (typically 5-50 KB per audit); the file is rewritten on every
+refresh so there's no unbounded growth.
+
+### Limits
 
 - One commit per refresh, per repo (no batch / range scanning yet).
 - No background poller; refresh runs synchronously in the TUI and
