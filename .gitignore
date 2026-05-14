@@ -38,3 +38,7 @@ audit-report.*
 
 # Monitor mode cache (per-cwd state file, never to be committed)
 .pwnguard-monitor.json
+
+# TUI export files (timestamped findings dumps from --review / --monitor)
+pwnguard-findings-*.md
+pwnguard-monitor-findings-*.md

@@ -568,10 +568,15 @@ Keys:
 | `→` | Expand the current finding (shows code, description, fix) |
 | `←` | Collapse the current finding |
 | `space` (or `x`) | Toggle a `[x]` mark on the current finding (visual only, doesn't affect exit code) |
+| `e` | Export every non-struck finding to a timestamped markdown file in the current directory (`pwnguard-findings-YYYYMMDD-HHMMSS.md`) |
 | `q` (or `esc`) | Quit |
 
 Marks are informational only. They don't change the threshold check or
 the exit code; the standard report is what drives commit pass/fail.
+
+Export is useful for pruning out false positives interactively, then
+handing the trimmed list to a colleague or pasting it into a ticket
+without editing the full `--report` output by hand.
 
 The expanded view shows the file path (dim cyan, plain text so you can
 select and copy it), CWE link (bright blue + underlined, OSC 8 clickable
@@ -624,9 +629,16 @@ self-hosted instances are not yet supported in monitor mode.
 | `←` | Collapse (alternative to `enter`) |
 | `-` | Collapse everything (all repos + all findings) |
 | `=` | Expand everything |
-| `space` | Mark the current repo viewed (clears the `[updated]` chip) |
+| `space` | Toggle strike-through on the current finding (also collapses if it was expanded). No-op on a repo row. |
+| `v` | Mark the current repo viewed (clears the `[updated]` chip) |
+| `e` | Export every non-struck finding across all repos to a timestamped markdown file in the current directory (`pwnguard-monitor-findings-YYYYMMDD-HHMMSS.md`), grouped by repo |
 | `r` | Refresh (poll all repos via API, audit anything new) |
 | `q` (or `esc`) | Save state and quit |
+
+The export is read-only: strike marks aren't cleared, persistent state
+(`.pwnguard-monitor.json`) is untouched. Pressing `e` again later
+produces a fresh file with the current view; old exports are left in
+place.
 
 ### How a refresh works
 

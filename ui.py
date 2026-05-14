@@ -27,6 +27,7 @@ class C:
     BOLD = "\033[1m"
     DIM = "\033[2m"
     UNDERLINE = "\033[4m"
+    STRIKETHROUGH = "\033[9m"
 
     # Foreground colors
     RED = "\033[91m"
@@ -154,6 +155,10 @@ def dim(text: str) -> str:
 
 def underline(text: str) -> str:
     return _wrap(text, C.UNDERLINE)
+
+
+def strikethrough(text: str) -> str:
+    return _wrap(text, C.STRIKETHROUGH)
 
 
 def green(text: str) -> str:

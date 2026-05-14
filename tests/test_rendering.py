@@ -122,7 +122,7 @@ def test_review_row_fits(width, finding, diff_lines, restore_term_width):
     with contextlib.redirect_stdout(buf):
         audit._render_review_row(
             finding,
-            checked=False,
+            marked=False,
             expanded=True,
             is_current=True,
             diff_lines=diff_lines,

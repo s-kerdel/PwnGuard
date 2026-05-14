@@ -50,7 +50,7 @@ from typing import Optional
 # Local sibling module; works because Python prepends script dir to sys.path.
 import ui
 
-__version__ = "0.2.1"  # PoC; bump when behaviour or config schema changes.
+__version__ = "0.2.2"  # PoC; bump when behaviour or config schema changes.
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -3345,6 +3345,101 @@ def write_report(result: AuditResult, path: str) -> None:
     print(ui.dim(f"PwnGuard: report written to {path}"), file=sys.stderr)
 
 
+def _default_findings_export_path(prefix: str = "pwnguard-findings") -> str:
+    """Timestamped filename in the current directory for TUI exports."""
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{prefix}-{ts}.md"
+
+
+def _severity_summary_line(findings: list) -> str:
+    """``N CRITICAL | N HIGH | ...`` skipping severities with zero count."""
+    counts: dict = {}
+    for f in findings:
+        counts[f.severity] = counts.get(f.severity, 0) + 1
+    parts = []
+    for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        if sev in counts:
+            parts.append(f"**{counts[sev]}** {sev}")
+    return " | ".join(parts)
+
+
+def export_findings_markdown(findings: list, path: str) -> None:
+    """Write a flat markdown findings report (used by --review export).
+
+    Sorted by severity then file/line, matching the on-screen order.
+    """
+    ordered = sorted(
+        findings,
+        key=lambda f: (
+            -SEVERITY_ORDER.get(f.severity, 0),
+            f.file or "",
+            f.line or 0,
+        ),
+    )
+    lines = [
+        "# PwnGuard Findings",
+        "",
+        f"_Exported {datetime.now().isoformat(timespec='seconds')}_",
+        "",
+    ]
+    summary = _severity_summary_line(ordered)
+    if summary:
+        lines.append(summary)
+        lines.append("")
+    if not ordered:
+        lines.append("_No findings to export._")
+    else:
+        for f in ordered:
+            lines.append(_finding_markdown(f))
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def export_monitor_findings_markdown(
+    grouped: list, path: str,
+) -> None:
+    """Write a per-repo grouped findings report for monitor mode.
+
+    ``grouped`` is ``[(repo_label, [Finding, ...]), ...]`` in display
+    order. Repos with no findings are skipped entirely.
+    """
+    total = sum(len(fs) for _, fs in grouped)
+    n_repos = sum(1 for _, fs in grouped if fs)
+    lines = [
+        "# PwnGuard Monitor Findings",
+        "",
+        f"_Exported {datetime.now().isoformat(timespec='seconds')}_",
+        "",
+        f"{total} finding{'s' if total != 1 else ''} across "
+        f"{n_repos} repo{'s' if n_repos != 1 else ''}.",
+        "",
+    ]
+    if total == 0:
+        lines.append("_No findings to export._")
+    else:
+        for name, fs in grouped:
+            if not fs:
+                continue
+            lines.append(f"## {name}")
+            lines.append("")
+            summary = _severity_summary_line(fs)
+            if summary:
+                lines.append(summary)
+                lines.append("")
+            ordered = sorted(
+                fs,
+                key=lambda f: (
+                    -SEVERITY_ORDER.get(f.severity, 0),
+                    f.file or "",
+                    f.line or 0,
+                ),
+            )
+            for f in ordered:
+                lines.append(_finding_markdown(f))
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
 # ---------------------------------------------------------------------------
 # --explain and --review
 # ---------------------------------------------------------------------------
@@ -3391,7 +3486,7 @@ REVIEW_BODY_INDENT = "        "  # 8 spaces
 
 def _render_review_row(
     f: Finding,
-    checked: bool,
+    marked: bool,
     expanded: bool,
     is_current: bool,
     diff_lines: dict,
@@ -3399,39 +3494,41 @@ def _render_review_row(
 ) -> None:
     """Print one finding row, optionally followed by its expanded body.
 
-    Collapsed rows print as a single navigation line: cursor + check
-    + badge + title + right-aligned metadata.
-
-    Expanded rows render as a bordered card. The cursor / check sit
-    outside the box (they're nav state, not finding content); the
-    severity badge, title, file:line, CWE and body all live inside.
+    Layout mirrors --monitor's finding row: cursor + severity badge +
+    title + right-aligned metadata. When ``marked`` is True the title
+    is struck through (acts as a "done / not relevant" cue).
     """
     cursor_mark = ui.bold(ui.cyan("❯")) if is_current else " "
-    check = "[x]" if checked else "[ ]"
     badge = _severity_marker(f.severity)
 
-    # Active row title is bold and colored by severity so the cursor
-    # position pops without relying purely on the leading '>' mark.
-    # Inactive rows stay in the default foreground so the list reads
-    # uniformly.
-    if is_current:
+    if marked:
+        # Struck-through rows recede regardless of cursor position -
+        # the user has signed off and shouldn't be distracted by the
+        # active-row highlight.
+        title_text = ui.dim(ui.strikethrough(f.title))
+    elif is_current:
         title_text = ui.bold(ui.severity_color(f.title, f.severity))
     else:
         title_text = f.title
 
-    # Right-side meta: full path:line (selectable) + CWE link.
     meta = _build_metadata(f)
+    if marked:
+        meta = ui.dim(meta)
 
     if not expanded:
-        prefix = f" {cursor_mark} {check}  {badge}  {title_text}"
-        pad = max(2, width - ui.visible_len(prefix) - ui.visible_len(meta))
-        print(prefix + (" " * pad) + meta)
+        prefix = f"   {cursor_mark}  {badge}  {title_text}"
+        title_w = ui.visible_len(prefix)
+        meta_w = ui.visible_len(meta)
+        if meta_w and title_w + META_MIN_GAP + meta_w <= width:
+            pad = width - title_w - meta_w
+            print(prefix + (" " * pad) + meta)
+        else:
+            print(prefix)
+            if meta_w:
+                print((" " * max(0, width - meta_w)) + meta)
         return
 
-    # Expanded: render via the shared card helper. Nav prefix (cursor
-    # + checkbox) is passed in so the helper places it to the left of
-    # the box's top-left corner; subsequent lines indent under it.
-    nav_prefix = f" {cursor_mark} {check}  "
+    nav_prefix = f"   {cursor_mark}  "
     _render_finding_card(
         f,
         diff_lines,
@@ -3452,11 +3549,12 @@ def _capture(fn, /, *args, **kwargs) -> list:
 
 def _render_review(
     findings: list,
-    checked: list,
+    marked: list,
     expanded: list,
     cursor: int,
     diff_lines: dict,
     observations: list,
+    status_line: str = "",
 ) -> None:
     """Full screen redraw of the review TUI, windowed to terminal height.
 
@@ -3476,45 +3574,45 @@ def _render_review(
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         _render_review_into_buffer(
-            findings, checked, expanded, cursor, diff_lines,
-            observations, width, height,
+            findings, marked, expanded, cursor, diff_lines,
+            observations, status_line, width, height,
         )
     _emit_tui_frame(buf.getvalue())
 
 
 def _render_review_into_buffer(
     findings: list,
-    checked: list,
+    marked: list,
     expanded: list,
     cursor: int,
     diff_lines: dict,
     observations: list,
+    status_line: str,
     width: int,
     height: int,
 ) -> None:
     """Inner render body. ``sys.stdout`` is redirected to the frame
     buffer by ``_render_review``; this function just emits lines."""
     n = len(findings)
-    marked = sum(checked)
+    n_marked = sum(marked)
 
-    # Capture every variable-height block so we can measure first,
-    # print second. Header + footer stay fixed in their positions;
-    # the findings region is what shrinks when space is tight.
     header_lines = [
         ui.bold("PwnGuard review") + ui.dim(f"  ·  {n} finding{'s' if n != 1 else ''}"),
-        ui.dim("  up/down navigate   enter toggle   -/= collapse/expand all   space=mark   q=quit"),
+        ui.dim("  up/down navigate   enter toggle   -/= collapse/expand all   space=strike   e=export   q=quit"),
     ]
     header_lines += _capture(_print_legend)
     header_lines.append("")  # blank after legend
 
     obs_lines = _capture(_print_observations, observations)
-    footer_lines = ["", ui.dim(f"  {marked}/{n} marked")]
+    footer_lines = ["", ui.dim(f"  {n_marked}/{n} struck")]
+    if status_line:
+        footer_lines.append(ui.dim(f"  {status_line}"))
 
     finding_blocks = []
     for i, f in enumerate(findings):
         finding_blocks.append(_capture(
             _render_review_row,
-            f, checked[i], expanded[i], (i == cursor), diff_lines, width,
+            f, marked[i], expanded[i], (i == cursor), diff_lines, width,
         ))
 
     # Available space for the findings region after reserving everything
@@ -3583,8 +3681,9 @@ def interactive_review(
     result: AuditResult,
     diff_lines: dict,
 ) -> None:
-    """Informative review TUI. Marks and expansions are local visual state
-    only - they don't affect findings, the threshold, or the exit code.
+    """Informative review TUI. Strike marks and expansions are local
+    visual state only - they don't affect findings, the threshold, or
+    the exit code.
 
     Keys:
       up / down               navigate
@@ -3593,14 +3692,14 @@ def interactive_review(
       left                    collapse current finding
       -                       collapse everything
       =                       expand everything
-      space, x                toggle marked indicator
+      space                   toggle strike-through (also collapses)
+      e                       export non-struck findings to a markdown file
       q, esc, Ctrl-C          quit
     """
     findings = _ordered_findings(result)
     if not findings:
         return
 
-    # Fall back to a no-op when we can't drive a TUI (non-TTY, Windows).
     if not ui.CbreakTerminal.available or not sys.stdin.isatty() or not sys.stdout.isatty():
         print(
             ui.dim("PwnGuard: interactive review unavailable (non-TTY or Windows). Skipping."),
@@ -3609,13 +3708,17 @@ def interactive_review(
         return
 
     n = len(findings)
-    checked = [False] * n
+    marked = [False] * n
     expanded = [False] * n
     cursor = 0
+    status_line = ""
 
     with ui.CbreakTerminal():
         while True:
-            _render_review(findings, checked, expanded, cursor, diff_lines, result.observations)
+            _render_review(
+                findings, marked, expanded, cursor, diff_lines,
+                result.observations, status_line,
+            )
             try:
                 key = ui.read_key()
             except KeyboardInterrupt:
@@ -3637,8 +3740,32 @@ def interactive_review(
                 expanded = [False] * n
             elif key == "=":
                 expanded = [True] * n
-            elif key in ("space", "x"):
-                checked[cursor] = not checked[cursor]
+            elif key == "space":
+                # Toggle strike-through. If the row was expanded when
+                # marking, collapse it - matches the "done, move on"
+                # flow.
+                if not marked[cursor]:
+                    marked[cursor] = True
+                    expanded[cursor] = False
+                else:
+                    marked[cursor] = False
+            elif key == "e":
+                # Export every non-struck finding to a timestamped
+                # markdown file in the current directory. Struck rows
+                # are the user's "resolved / ignore" pile, so they are
+                # omitted; everything else is fair game for the report.
+                unstruck = [
+                    f for i, f in enumerate(findings) if not marked[i]
+                ]
+                path = _default_findings_export_path()
+                try:
+                    export_findings_markdown(unstruck, path)
+                    status_line = (
+                        f"exported {len(unstruck)} finding"
+                        f"{'s' if len(unstruck) != 1 else ''} → {path}"
+                    )
+                except OSError as exc:
+                    status_line = f"export failed: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -3747,6 +3874,7 @@ def _render_monitor_finding_row(
     is_current: bool,
     width: int,
     diff_lines: Optional[dict] = None,
+    is_marked: bool = False,
 ) -> None:
     """Print a finding row inside the monitor dashboard.
 
@@ -3754,19 +3882,22 @@ def _render_monitor_finding_row(
     severity badge + title + right-aligned file:line / CWE. Expanded
     form uses the shared finding-card helper so the full description,
     suggestion, fix_example, AND the ±3 line code preview render the
-    same way they do in ``--review``. ``diff_lines`` is the cached
-    per-commit mapping the monitor state file persists alongside
-    findings; when missing or empty the card falls back to a
-    placeholder, same as --review would.
+    same way they do in ``--review``. ``is_marked`` strikes the title
+    through as a "done / not relevant" cue.
     """
     cursor_mark = ui.bold(ui.cyan("❯")) if is_current else " "
     badge = _severity_marker(f.severity)
-    if is_current:
+    if is_marked:
+        # Struck-through rows recede regardless of cursor position.
+        title_text = ui.dim(ui.strikethrough(f.title))
+    elif is_current:
         title_text = ui.bold(ui.severity_color(f.title, f.severity))
     else:
         title_text = f.title
 
     meta = _build_metadata(f)
+    if is_marked:
+        meta = ui.dim(meta)
 
     if not is_expanded:
         prefix = f"   {cursor_mark}  {badge}  {title_text}"
@@ -3850,6 +3981,7 @@ def _render_monitor(
     cursor: int,
     repo_expanded: dict,
     finding_expanded: dict,
+    finding_marked: dict,
     status_line: str,
 ) -> None:
     """Full-screen redraw of the monitor dashboard.
@@ -3865,7 +3997,7 @@ def _render_monitor(
     with contextlib.redirect_stdout(buf):
         _render_monitor_into_buffer(
             state, keys, items, cursor,
-            repo_expanded, finding_expanded, status_line,
+            repo_expanded, finding_expanded, finding_marked, status_line,
             width, height,
         )
     _emit_tui_frame(buf.getvalue())
@@ -3878,6 +4010,7 @@ def _render_monitor_into_buffer(
     cursor: int,
     repo_expanded: dict,
     finding_expanded: dict,
+    finding_marked: dict,
     status_line: str,
     width: int,
     height: int,
@@ -3892,7 +4025,7 @@ def _render_monitor_into_buffer(
         ),
         ui.dim(
             "  up/down navigate   enter toggle   -/= collapse/expand all   "
-            "space=mark viewed   r=refresh   q=quit"
+            "space=strike   v=mark viewed   e=export   r=refresh   q=quit"
         ),
     ]
     header_lines += _capture(_print_legend)
@@ -3941,6 +4074,7 @@ def _render_monitor_into_buffer(
                         f,
                         is_expanded=finding_expanded.get((key, idx), False),
                         is_current=(i == cursor),
+                        is_marked=finding_marked.get((key, idx), False),
                         width=width,
                         diff_lines=diff_lines,
                     )
@@ -4092,7 +4226,10 @@ def interactive_monitor(
       left              collapse
       -                 collapse everything (all repos + all findings)
       =                 expand everything
-      space, x          mark current repo viewed (clears [updated] chip)
+      space             toggle strike-through on the current finding
+                        (also collapses if it was expanded). On a repo
+                        row this is a no-op.
+      v                 mark the current repo viewed (clears [updated])
       r                 refresh (poll all repos, audit anything new)
       q, esc, Ctrl-C    save state and quit
     """
@@ -4128,6 +4265,7 @@ def interactive_monitor(
     # state survives a refresh that adds or reorders repos / findings.
     repo_expanded: dict = {}
     finding_expanded: dict = {}
+    finding_marked: dict = {}
     items = _build_monitor_items(state, keys, repo_expanded)
     cursor = 0
     status_line = "loaded cached state — press [r] to refresh"
@@ -4167,7 +4305,8 @@ def interactive_monitor(
             while True:
                 _render_monitor(
                     state, keys, items, cursor,
-                    repo_expanded, finding_expanded, status_line,
+                    repo_expanded, finding_expanded, finding_marked,
+                    status_line,
                 )
                 try:
                     pressed = ui.read_key()
@@ -4209,7 +4348,17 @@ def interactive_monitor(
                             finding_expanded[ekey] = (
                                 not finding_expanded.get(ekey, False)
                             )
-                elif pressed in ("space", "x") and current:
+                elif pressed == "space" and current:
+                    kind, key, idx = current
+                    if kind == "finding":
+                        ekey = (key, idx)
+                        if not finding_marked.get(ekey, False):
+                            # Strike + collapse if the card was open.
+                            finding_marked[ekey] = True
+                            finding_expanded[ekey] = False
+                        else:
+                            finding_marked[ekey] = False
+                elif pressed == "v" and current:
                     kind, key, _ = current
                     if kind == "repo":
                         entry = state["repos"].get(key)
@@ -4218,6 +4367,36 @@ def interactive_monitor(
                             status_line = (
                                 f"marked '{entry.get('name', '?')}' viewed"
                             )
+                elif pressed == "e":
+                    # Export non-struck findings across every repo,
+                    # grouped by repo, to a timestamped markdown file
+                    # in the current directory. Strike marks are the
+                    # user's "resolved / ignore" signal so we drop
+                    # them; nothing in persistent state changes.
+                    grouped = []
+                    total_kept = 0
+                    for key in keys:
+                        entry = state.get("repos", {}).get(key) or {}
+                        raw = entry.get("findings") or []
+                        kept = [
+                            _finding_from_state_dict(d)
+                            for i, d in enumerate(raw)
+                            if not finding_marked.get((key, i), False)
+                        ]
+                        total_kept += len(kept)
+                        label = entry.get("name") or entry.get("url") or key
+                        grouped.append((label, kept))
+                    path = _default_findings_export_path(
+                        "pwnguard-monitor-findings",
+                    )
+                    try:
+                        export_monitor_findings_markdown(grouped, path)
+                        status_line = (
+                            f"exported {total_kept} finding"
+                            f"{'s' if total_kept != 1 else ''} → {path}"
+                        )
+                    except OSError as exc:
+                        status_line = f"export failed: {exc}"
                 elif pressed == "-":
                     # Collapse everything: all repos closed, every
                     # finding card closed.
@@ -4273,7 +4452,8 @@ def interactive_monitor(
                         status_line = "refreshing..."
                         _render_monitor(
                             state, keys, items, cursor,
-                            repo_expanded, finding_expanded, status_line,
+                            repo_expanded, finding_expanded, finding_marked,
+                            status_line,
                         )
 
                         def _progress(i, total, name, msg):
@@ -4283,7 +4463,8 @@ def interactive_monitor(
                             )
                             _render_monitor(
                                 state, keys, items, cursor,
-                                repo_expanded, finding_expanded, status_line,
+                                repo_expanded, finding_expanded,
+                                finding_marked, status_line,
                             )
 
                         try:
