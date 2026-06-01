@@ -68,7 +68,7 @@ You can also point it at:
 - A live GitLab MR / commit or GitHub PR / commit (via API)
 
 For the architecture pipeline and how findings are anchored back to
-file/line, see [docs/architecture.md](docs/architecture.md).
+file/line, see [docs/architecture.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/architecture.md).
 
 ## Current focus
 
@@ -94,7 +94,7 @@ falls back to Ollama. In CI it uses Ollama by default; if
 backend is always opt-in via `--backend openai-compat`.
 
 For picking an Ollama model by VRAM tier, see
-[docs/ollama-guide.md](docs/ollama-guide.md).
+[docs/ollama-guide.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/ollama-guide.md).
 
 ## Setup
 
@@ -165,11 +165,11 @@ PwnGuard ships with sensible defaults for every other knob.
 | Anthropic API backend | `ANTHROPIC_API_KEY` env var (or a line in `.pwnguard.env`); `pipx install "pwnguard[claude-api]"` to pull in the `anthropic` package |
 | Any OpenAI-compatible endpoint (LiteLLM, vLLM, OpenRouter, Groq, …) | `OPENAI_API_KEY` env var **and** an `openai:` block in `pwnguard.yaml` setting `url` and `model` |
 | Scanning a GitLab MR / GitHub PR via `--from-url` | `GITLAB_TOKEN` (required for GitLab) and/or `GITHUB_TOKEN` (required for private GitHub repos) |
-| Monitor mode (`--monitor`) | A `monitor.repos:` block in `pwnguard.yaml` — see [docs/monitor-mode.md](docs/monitor-mode.md) |
+| Monitor mode (`--monitor`) | A `monitor.repos:` block in `pwnguard.yaml` — see [docs/monitor-mode.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/monitor-mode.md) |
 | Custom severity threshold, ignore patterns, model, etc. | A `pwnguard.yaml` containing only the keys you want to override — deep-merged on top of defaults |
 
 For developing PwnGuard itself or running the test suite, see
-[docs/development.md](docs/development.md).
+[docs/development.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/development.md).
 
 ## Configuration files
 
@@ -309,14 +309,14 @@ Every flag accepted by `pwnguard`. Default values come from
 |------|---------|---------|
 | `--threshold {CRITICAL,HIGH,MEDIUM,LOW,INFO}` | from config (`HIGH`) | Severity threshold that blocks (exit 1). |
 | `--dry-run` | off | Show what would be sent to the AI (files, diff size, token estimate) without making the API call. |
-| `--review` | off | After the scan, drop into an interactive TUI to step through findings. See [docs/review-tui.md](docs/review-tui.md). |
+| `--review` | off | After the scan, drop into an interactive TUI to step through findings. See [docs/review-tui.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/review-tui.md). |
 | `--explain <N>` | (none) | Re-query the AI for a deeper explanation of finding number `N` (1-indexed). Adds one extra AI call. |
 
 ### Performance / handling for large diffs
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--chunk-per-file` | off (auto-enabled on overflow) | Split the diff at `diff --git` boundaries and scan each file separately, then merge findings. Auto-enabled when the estimated prompt+response exceeds Ollama's `num_ctx`. See [docs/ollama-guide.md](docs/ollama-guide.md). |
+| `--chunk-per-file` | off (auto-enabled on overflow) | Split the diff at `diff --git` boundaries and scan each file separately, then merge findings. Auto-enabled when the estimated prompt+response exceeds Ollama's `num_ctx`. See [docs/ollama-guide.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/ollama-guide.md). |
 | `--ollama-format {json,raw}` | `json` | Ollama output mode. `json` forces valid JSON via constrained generation (reliable, ~2x slower on 7B). `raw` lets the model emit freely (faster, relies on PwnGuard's parse fallbacks). |
 
 ### Environment / credentials
@@ -614,17 +614,17 @@ hard gate.
 ## Security
 
 Please report vulnerabilities privately via the process in
-[SECURITY.md](SECURITY.md).
+[SECURITY.md](https://github.com/s-kerdel/PwnGuard/blob/main/SECURITY.md).
 
 ## Further documentation
 
 In-depth guides live under `docs/`:
 
-- [Architecture & opaque anchor tokens](docs/architecture.md) — how the diff is tagged, sent to the model, and resolved back to file/line.
-- [Interactive review TUI](docs/review-tui.md) — `--review` key bindings and workflow.
-- [Monitor mode (`--monitor`)](docs/monitor-mode.md) — dashboard for watching remote repos and auditing each new commit as it lands.
-- [Choosing an Ollama model & handling large diffs](docs/ollama-guide.md) — local-model picks by VRAM tier, plus the chunked-mode trade-off when a diff overflows the context window.
-- [Development & testing](docs/development.md) — running the pytest suite, the `--self-test` entry point, and the pre-commit auto-run for this repo.
+- [Architecture & opaque anchor tokens](https://github.com/s-kerdel/PwnGuard/blob/main/docs/architecture.md) — how the diff is tagged, sent to the model, and resolved back to file/line.
+- [Interactive review TUI](https://github.com/s-kerdel/PwnGuard/blob/main/docs/review-tui.md) — `--review` key bindings and workflow.
+- [Monitor mode (`--monitor`)](https://github.com/s-kerdel/PwnGuard/blob/main/docs/monitor-mode.md) — dashboard for watching remote repos and auditing each new commit as it lands.
+- [Choosing an Ollama model & handling large diffs](https://github.com/s-kerdel/PwnGuard/blob/main/docs/ollama-guide.md) — local-model picks by VRAM tier, plus the chunked-mode trade-off when a diff overflows the context window.
+- [Development & testing](https://github.com/s-kerdel/PwnGuard/blob/main/docs/development.md) — running the pytest suite, the `--self-test` entry point, and the pre-commit auto-run for this repo.
 
 ## Acknowledgments
 
