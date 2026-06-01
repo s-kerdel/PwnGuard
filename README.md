@@ -19,22 +19,18 @@ automatically via `composer install`.
 - [Current focus](#current-focus)
 - [Backends](#backends)
 - [Setup](#setup)
-- [How it works](#how-it-works)
 - [Common workflows](#common-workflows)
 - [CLI reference](#cli-reference)
 - [Configuration reference (`pwnguard.yaml`)](#configuration-reference-pwnguardyaml)
 - [Environment variables](#environment-variables)
 - [Exit codes](#exit-codes)
 - [Output modes](#output-modes)
-- [Interactive review (TUI)](#interactive-review-tui)
-- [Monitor mode (`--monitor`)](#monitor-mode---monitor)
 - [Remote fetching from GitLab / GitHub](#remote-fetching-from-gitlab--github)
-- [Choosing an Ollama model](#choosing-an-ollama-model)
-- [When the diff doesn't fit in the local model](#when-the-diff-doesnt-fit-in-the-local-model)
 - [GitLab CI](#gitlab-ci)
 - [Enforcement](#enforcement)
 - [Limitations](#limitations)
 - [Security](#security)
+- [Further documentation](#further-documentation)
 
 ## What it does
 
@@ -49,6 +45,9 @@ You can also point it at:
 - A local file (manual scan)
 - A pre-saved diff on disk (offline testing)
 - A live GitLab MR / commit or GitHub PR / commit (via API)
+
+For the architecture pipeline and how findings are anchored back to
+file/line, see [docs/architecture.md](docs/architecture.md).
 
 ## Current focus
 
@@ -72,6 +71,9 @@ Auto-detection: locally the tool checks for the `claude` CLI first and
 falls back to Ollama. In CI it uses Ollama by default; if
 `ANTHROPIC_API_KEY` is set, it uses claude-api. The `openai-compat`
 backend is always opt-in via `--backend openai-compat`.
+
+For picking an Ollama model by VRAM tier, see
+[docs/ollama-guide.md](docs/ollama-guide.md).
 
 ## Setup
 
@@ -115,108 +117,17 @@ The pre-commit hook is now installed. Every developer who runs
 - `pyyaml==6.0.2` (install with `pip install --user pyyaml`)
 - One of: Claude Code CLI, an Ollama server, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` (for any OpenAI-compatible endpoint)
 
-### Running the test suite
-
-Tests live in `tests/` and cover the anchor pipeline, JSON parse +
-repair stages, diff input validation, box-card width math, the
-security primitives (`_sanitize`, `_is_safe_ref`), the CI-gate
-dataclass methods (`AuditResult.exceeds_threshold` etc.), the
-`filter_diff` ignore-pattern + language-focus + truncation paths,
-and `--from-url` routing. Install the dev deps and run pytest from
-the project root:
-
-```bash
-pip install --user -r requirements-dev.txt
-python3 -m pytest tests/ -v
-```
-
-No network, no LLM calls — the deterministic pieces are exercised
-directly so a regression in the anchor system or the parser
-fallbacks fails fast.
-
-**URL routing tests use mocked HTTP, not real requests.** The
-`--from-url` tests replace `_http_get` with a recorder via pytest's
-`monkeypatch` fixture, then assert that each URL shape (GitLab MR /
-commit / GitHub PR / commit) routes to the correct API endpoint and
-forwards the right auth header from the right env var. This catches
-regex / dispatch regressions and header-name mistakes (`PRIVATE-TOKEN`
-vs `Authorization` mix-ups), but **does not** validate platform-side
-behaviour: self-hosted GitLab path differences, GitHub Enterprise
-host suffixes, rate-limit responses, TLS errors, and API schema
-changes all remain things a live integration test would need to
-catch separately.
-
-Two convenience entry points:
-
-- `python3 audit.py --self-test` — same suite, callable from anywhere
-  an install of PwnGuard is reachable. Useful for verifying a fresh
-  install is healthy.
-- **Pre-commit auto-run (PwnGuard's own repo only)** — when this
-  repo's pre-commit hook fires, it runs `pytest tests/` *before* the
-  security scan. Test failures block the commit, since a regressed
-  auditor produces unreliable findings. Detected by the standalone
-  layout (`audit.py` at repo root + `tests/test_anchors.py` present),
-  so consumer projects never see this step.
-
-## How it works
-
-```
-git commit
-    |
-    v
-pre-commit hook runs audit.py
-    |
-    v
-Extracts staged diff (only changed files)
-    |
-    v
-Filters by ignore_patterns + language_focus
-    |
-    v
-Tags each content line with an opaque anchor token  ([a1] [a2] ...)
-and builds an anchor -> (file, line) lookup table
-    |
-    v
-Sends to Claude Code / Claude API / Ollama / OpenAI-compat
-    |
-    v
-Parses JSON response. Each finding carries its anchor;
-the host resolves it back to (file, line) via the table
-    |
-    v
-HIGH or CRITICAL found? --> Block commit (exit 1)
-Otherwise                --> Allow commit (exit 0)
-```
-
-### Locating findings: opaque anchor tokens
-
-Every added / context line in the diff is prefixed with a short
-**opaque token** (`[a1]`, `[a2]`, ...) before it is sent to the model.
-The model is told to report each finding's location by **echoing the
-token back** in an `anchor` field; it does **not** report file paths
-or line numbers itself. The host then resolves the anchor against the
-table it built during tagging - a single dict lookup per finding.
-
-Why it matters:
-
-- **No line-counting drift.** Tokens are opaque - they can only be
-  copied, not regenerated from "where this code probably is", which
-  was the failure mode of plain line-number prefixes on smaller
-  models past ~30 rows.
-- **Cross-file collisions cannot happen.** Two functions named
-  `lookup_user` in two files get distinct anchors, so a finding's
-  file/line is never inferred by string-matching.
-- **Loud failure on fabrication.** If the model invents an unknown
-  token, the finding is dropped with a stderr warning instead of
-  being silently mis-located.
-
-The pipeline degrades gracefully: if a model genuinely cannot tie a
-finding to one line (a project-wide config concern, missing-file
-issue), it omits `anchor` and supplies a bare `file` instead. Those
-file-level findings are kept; everything else must resolve through
-the table.
+For running the test suite and the `--self-test` entry point, see
+[docs/development.md](docs/development.md).
 
 ## Common workflows
+
+> **Invocation path.** The examples below use `python3 pwnguard/audit.py` —
+> the layout you get after `composer install` drops the `pwnguard/`
+> directory into your project. If you're running directly from a clone of
+> this repository, the entry point is at the root, so use
+> `python3 audit.py` (drop the `pwnguard/` prefix). The pre-commit hook
+> auto-detects both layouts; only manual invocations differ.
 
 ### Local pre-commit (default)
 Hook fires automatically on `git commit`. Scans only the staged diff.
@@ -259,7 +170,7 @@ python3 pwnguard/audit.py --diff-file /tmp/branch.diff --review
 ```bash
 python3 pwnguard/audit.py --from-url "<URL>" --review
 # Use arrow keys to navigate, right/left to expand/collapse,
-# space to mark, q to quit. See "Interactive review (TUI)".
+# space to mark, q to quit. Full key bindings: docs/review-tui.md
 ```
 
 ### Watch what the model is doing in real time
@@ -325,14 +236,14 @@ Every flag accepted by `audit.py`. Default values come from
 |------|---------|---------|
 | `--threshold {CRITICAL,HIGH,MEDIUM,LOW,INFO}` | from config (`HIGH`) | Severity threshold that blocks (exit 1). |
 | `--dry-run` | off | Show what would be sent to the AI (files, diff size, token estimate) without making the API call. |
-| `--review` | off | After the scan, drop into an interactive TUI to step through findings. See [Interactive review](#interactive-review-tui). |
+| `--review` | off | After the scan, drop into an interactive TUI to step through findings. See [docs/review-tui.md](docs/review-tui.md). |
 | `--explain <N>` | (none) | Re-query the AI for a deeper explanation of finding number `N` (1-indexed). Adds one extra AI call. |
 
 ### Performance / handling for large diffs
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--chunk-per-file` | off (auto-enabled on overflow) | Split the diff at `diff --git` boundaries and scan each file separately, then merge findings. Auto-enabled when the estimated prompt+response exceeds Ollama's `num_ctx`. See [When the diff doesn't fit](#when-the-diff-doesnt-fit-in-the-local-model). |
+| `--chunk-per-file` | off (auto-enabled on overflow) | Split the diff at `diff --git` boundaries and scan each file separately, then merge findings. Auto-enabled when the estimated prompt+response exceeds Ollama's `num_ctx`. See [docs/ollama-guide.md](docs/ollama-guide.md). |
 | `--ollama-format {json,raw}` | `json` | Ollama output mode. `json` forces valid JSON via constrained generation (reliable, ~2x slower on 7B). `raw` lets the model emit freely (faster, relies on PwnGuard's parse fallbacks). |
 
 ### Environment / credentials
@@ -554,196 +465,6 @@ Per-request stats print at the end:
 PwnGuard: prompt: 6,142 tokens  ·  output: 423 tokens  ·  84.2 t/s  ·  stop: stop
 ```
 
-## Interactive review (TUI)
-
-Pass `--review` to walk through findings interactively after a scan.
-Uses raw-mode keyboard input on the alternate screen buffer (Unix
-only; gracefully no-ops on Windows or non-TTY).
-
-Keys:
-
-| Key | Action |
-|-----|--------|
-| `↑` / `↓` | Move the cursor to the previous / next finding |
-| `→` | Expand the current finding (shows code, description, fix) |
-| `←` | Collapse the current finding |
-| `space` (or `x`) | Toggle a `[x]` mark on the current finding (visual only, doesn't affect exit code) |
-| `e` | Export every non-struck finding to a timestamped markdown file in the current directory (`pwnguard-findings-YYYYMMDD-HHMMSS.md`) |
-| `q` (or `esc`) | Quit |
-
-Marks are informational only. They don't change the threshold check or
-the exit code; the standard report is what drives commit pass/fail.
-
-Export is useful for pruning out false positives interactively, then
-handing the trimmed list to a colleague or pasting it into a ticket
-without editing the full `--report` output by hand.
-
-The expanded view shows the file path (dim cyan, plain text so you can
-select and copy it), CWE link (bright blue + underlined, OSC 8 clickable
-in modern terminals), the affected code with red `-` prefix + line
-numbers, the description, and a bold-green `Fix:` recommendation, all
-inside a dashed card.
-
-## Monitor mode (`--monitor`)
-
-A dashboard TUI that watches one or more remote repos, audits the
-latest commit on each watched branch when it changes, and lets you
-step through findings without re-running the audit. Designed for
-"catch attention on new released work" workflows — you get a quick
-heads-up that something landed, then validate manually.
-
-Open the dashboard:
-
-```bash
-python3 audit.py --monitor
-```
-
-State is cached in `.pwnguard-monitor.json` in the current working
-directory (per-project), with mode `0600` on Unix. Run from two
-different directories and you get two independent caches.
-
-### Configure repos in `pwnguard.yaml`
-
-```yaml
-monitor:
-  repos:
-    - name: api-server
-      url: https://gitlab.com/group/api-server
-      branch: main
-    - name: vendor-fork
-      url: https://github.com/owner/repo
-      branch: upstream
-```
-
-Each entry needs `name`, `url`, and `branch`. Hostname must contain
-`gitlab` or `github` for the platform to auto-detect; custom-domain
-self-hosted instances are not yet supported in monitor mode.
-
-### Key bindings
-
-| Key | Action |
-|-----|--------|
-| `↑` / `↓` | Move the cursor between repos / findings |
-| `enter` | Toggle expand / collapse on the current row |
-| `→` | Expand (alternative to `enter`) |
-| `←` | Collapse (alternative to `enter`) |
-| `-` | Collapse everything (all repos + all findings) |
-| `=` | Expand everything |
-| `space` | Toggle strike-through on the current finding (also collapses if it was expanded). No-op on a repo row. |
-| `v` | Mark the current repo viewed (clears the `[updated]` chip) |
-| `e` | Export every non-struck finding across all repos to a timestamped markdown file in the current directory (`pwnguard-monitor-findings-YYYYMMDD-HHMMSS.md`), grouped by repo |
-| `r` | Refresh (poll all repos via API, audit anything new) |
-| `q` (or `esc`) | Save state and quit |
-
-The export is read-only: strike marks aren't cleared, persistent state
-(`.pwnguard-monitor.json`) is untouched. Pressing `e` again later
-produces a fresh file with the current view; old exports are left in
-place.
-
-### How a refresh works
-
-For each configured repo, PwnGuard calls the platform's list-commits
-API, compares the latest SHA on the branch to the cached
-`last_audited_sha`, and decides:
-
-- **First encounter** — no cached SHA yet. The current HEAD is
-  audited so the dashboard reflects branch state immediately on the
-  first `[r]` press. Costs one LLM call per repo on initial setup.
-  The `[updated]` chip is suppressed on this initial audit (you're
-  staring at the result; nothing to "catch up on").
-- **No change** — head matches cache. Skip; no LLM call.
-- **New commit** — exactly one commit (the latest) is audited.
-  Intermediate commits between cache and head are not audited; the
-  diff against `last_audited_sha` is what gets sent to the model.
-  The `[updated]` chip fires until you press `[space]`.
-
-The cap of one commit per repo per refresh keeps the worst-case
-refresh time bounded and avoids ballooning the prompt past a small
-model's context window. If a backlog of unscanned commits matters
-for your workflow, this is the knob to revisit in a follow-up
-release.
-
-### Verifying the model is actually running (`--debug`)
-
-`python3 audit.py --monitor --debug` keeps the dashboard, but pressing
-`r` temporarily drops out of the TUI so the backend's live token
-stream prints to your normal terminal (same streaming output you'd
-see from `--debug` on a regular scan). When the refresh finishes you
-press Enter to return to the dashboard. Useful for confirming that
-Ollama (or whichever backend) is actually being called, watching
-prompt processing speed, and spotting truncated / refused responses.
-
-### The `[updated]` chip
-
-A repo row shows `[updated]` when `last_audited_sha != last_viewed_sha`
-— i.e. PwnGuard has audited a new commit since you last acknowledged
-this repo. Pressing `[space]` while the cursor is on the row sets
-viewed = audited and the chip clears.
-
-### What each repo row shows
-
-Reading left to right:
-
-- Cursor mark (`❯` in bold cyan when the row is the active one)
-- Expand arrow (`▶` collapsed, `▼` expanded)
-- Repo name
-- Severity breakdown — `1 C  ·  3 H  ·  5 M  ·  12 INFO`, coloured per
-  severity, only categories with non-zero counts shown. `clean` when
-  audited with no findings; `awaiting first refresh` before the first
-  audit on a freshly-configured repo
-- Right-aligned: short commit date (`3d`, `2w`, etc.), short SHA, and
-  the `[updated]` chip when there's been an audit since you last
-  pressed `[space]` on this row
-
-Expanding a row reveals its findings as individually-selectable rows;
-expanding an individual finding shows the same boxed card layout
-`--review` uses, including the ±3-line code preview window (diff
-content is cached alongside findings so this is offline).
-
-### What the state file contains
-
-```json
-{
-  "version": 1,
-  "repos": {
-    "https://gitlab.com/group/api-server@main": {
-      "name":                       "api-server",
-      "last_audited_sha":           "abc1234...",
-      "last_viewed_sha":            "abc1234...",
-      "last_audited_commit_date":   "2026-05-15T09:00:00+00:00",
-      "audited_at":                 "2026-05-15T09:14:00+00:00",
-      "findings":                   [ /* asdict(Finding) per finding */ ],
-      "diff_lines":                 { "src/users.py": { "42": "..." } }
-    }
-  }
-}
-```
-
-The file is JSON (never `pickle` — that would be unsafe to load
-from disk). Findings and cached diff lines are re-sanitised on load
-as belt-and-braces against an offline-tampered cache; even a
-hand-edited state file cannot smuggle ANSI escapes into the renderer.
-Tokens are read from env vars only and **never** persisted.
-
-`diff_lines` is the per-commit code cache the TUI uses to draw the
-±3-line preview window without re-fetching. Size is bounded by the
-commit (typically 5-50 KB per audit); the file is rewritten on every
-refresh so there's no unbounded growth.
-
-### Limits
-
-- One commit per refresh, per repo (no batch / range scanning yet).
-- No background poller; refresh runs synchronously in the TUI and
-  blocks for the duration. Wire `pwnguard --monitor` to a wrapper
-  later if you want it on a cron schedule.
-- No notification outputs (Slack / email / etc.). Findings live in
-  the TUI and the state file.
-- No platform support beyond GitLab and GitHub (custom-domain
-  self-hosted instances are deferred until there's a clean way to
-  configure platform explicitly).
-- Concurrent runs of `--monitor` in the same cwd will race on the
-  state file. Treated as a cache; last writer wins.
-
 ## Remote fetching from GitLab / GitHub
 
 `--from-url <URL>` fetches the diff via the platform API. Auto-detects
@@ -761,93 +482,6 @@ Self-hosted GitLab works (any host with the standard `/-/` URL shape).
 GitHub Enterprise works via `/api/v3` on the same host.
 
 Tokens are read from env vars (see above) or from `.pwnguard.env`.
-
-## Choosing an Ollama model
-
-Local quality scales with model size and VRAM. PwnGuard's prompt asks
-the model to return JSON with optional fields (like a `fix_example` code
-snippet); larger models follow the schema more reliably, smaller models
-catch the obvious stuff but skip optional fields and miss subtle bugs.
-
-Rule of thumb by VRAM (Q4 quantization):
-
-| VRAM   | Suggested model | Realistic expectation |
-|--------|-----------------|------------------------|
-| 6 GB   | `qwen2.5-coder:7b` | Obvious vulns (SQLi, eval, missing CSRF); few optional fields populated |
-| 8 GB   | `qwen2.5-coder:7b` (sweet spot) | Same as above with comfortable headroom for context |
-| 12 GB  | `qwen2.5-coder:14b` | Better recall; more optional fields populated |
-| 16 GB+ | `qwen2.5-coder:32b` / `codestral:22b` | Closest local quality to Claude; still trails on subtle / auth-bypass logic |
-
-What lower-B models do well:
-
-- Pattern-matching obvious sinks: `eval()`, `unserialize()` without
-  allowlist, raw SQL interpolation, `file_get_contents()` on user input.
-- Spotting missing escaping in templates.
-
-What lower-B models miss:
-
-- Multi-step / second-order vulnerabilities (data flows from A through B
-  to dangerous sink C).
-- Framework-specific auth bypass patterns (Shopware ACL, CakePHP
-  `allowUnauthenticated`).
-- Optional JSON fields like `fix_example` are frequently dropped.
-- **Anchor choice quality** - the file and line themselves are always
-  correct (resolved from the opaque-token table, not the model's own
-  counting), but a 7B model may anchor to a function header instead
-  of the exact statement inside the function. The ±3-line context
-  window around the anchored line keeps the real sink visible.
-
-If the local quality isn't enough for your codebase, switch to the
-`claude-code` backend (uses your Pro subscription, no local VRAM, much
-smarter). Local Ollama remains the right call for CI and offline work.
-
-## When the diff doesn't fit in the local model
-
-For diffs that exceed your Ollama `num_ctx` (typically big MRs touching
-many files), PwnGuard auto-falls-back to **chunked mode** - splitting
-the diff at `diff --git` boundaries and scanning each file
-independently, then merging findings.
-
-You can also force this manually with `--chunk-per-file`.
-
-If a single file's diff is *itself* too big to fit in `num_ctx` (e.g.
-a single file with several hundred changed lines), the chunker falls
-back further: it splits that file at hunk (`@@`) boundaries and scans
-each hunk group as its own sub-chunk. Each sub-chunk repeats the file
-header so it parses as a self-contained mini-diff. You'll see this in
-the progress output as `path/to/file.php  (part 2/4)`.
-
-Single hunks that are themselves over budget (rare, but possible for
-auto-generated code or unusually large change blocks) get sent in one
-piece anyway - PwnGuard doesn't slice inside a hunk because that would
-corrupt the hunk's `@@ -X,Y +A,B @@` line arithmetic.
-
-The honest trade-off - chunked mode is **less precise but more complete**:
-
-- **You gain**: every file actually gets reviewed, instead of half the
-  MR being silently dropped at the context boundary. With hunk-level
-  fallback, even a single oversized file gets scanned in pieces rather
-  than truncated.
-- **You lose**: cross-file context. The model sees one file at a time,
-  so it doesn't know whether the sanitizer in `Helpers.php` wraps a
-  call in `Controller.php`, or whether an auth helper called
-  correctly-looking is actually broken upstream. With hunk-level
-  fallback, you also lose cross-hunk context within the same file.
-  Expect a few more false positives and the occasional missed
-  cross-file (or cross-hunk) bug.
-
-Priority hierarchy:
-
-1. **Best**: full diff fits in context → one AI call with full
-   cross-file awareness (the default when there's no overflow).
-2. **Acceptable fallback**: diff overflows → chunked mode runs
-   automatically. Some precision loss, but coverage beats truncation.
-3. **Worst (what we avoid)**: diff overflows AND we don't chunk →
-   Ollama silently truncates, half the MR is invisible.
-
-If you want option-1 quality on a big MR, switch to
-`--backend claude-code` (200k context, no chunking needed regardless
-of size).
 
 ## GitLab CI
 
@@ -908,3 +542,13 @@ hard gate.
 
 Please report vulnerabilities privately via the process in
 [SECURITY.md](SECURITY.md).
+
+## Further documentation
+
+In-depth guides live under `docs/`:
+
+- [Architecture & opaque anchor tokens](docs/architecture.md) — how the diff is tagged, sent to the model, and resolved back to file/line.
+- [Interactive review TUI](docs/review-tui.md) — `--review` key bindings and workflow.
+- [Monitor mode (`--monitor`)](docs/monitor-mode.md) — dashboard for watching remote repos and auditing each new commit as it lands.
+- [Choosing an Ollama model & handling large diffs](docs/ollama-guide.md) — local-model picks by VRAM tier, plus the chunked-mode trade-off when a diff overflows the context window.
+- [Development & testing](docs/development.md) — running the pytest suite, the `--self-test` entry point, and the pre-commit auto-run for this repo.
