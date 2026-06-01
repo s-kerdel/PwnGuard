@@ -318,6 +318,15 @@ def main():
             "repository you want to protect."
         ),
     )
+    setup_group.add_argument(
+        "--uninstall-hook",
+        action="store_true",
+        help=(
+            "Remove PwnGuard's pre-commit hook from the current git "
+            "repository. Only removes the hook if PwnGuard installed it; "
+            "a user-owned or third-party hook is left untouched."
+        ),
+    )
 
     # Bare `pwnguard` with no flags: show help without the Advanced
     # group, then point at `--help` for the full reference. Without
@@ -331,12 +340,15 @@ def main():
 
     args = parser.parse_args()
 
-    # --install-hook short-circuits every other flag: no backend, no
-    # diff, no yaml load. Drop the bundled pre-commit script into the
-    # current repo's .git/hooks/ and exit.
+    # --install-hook / --uninstall-hook short-circuit every other flag:
+    # no backend, no diff, no yaml load. Drop or remove the bundled
+    # pre-commit script in the current repo's .git/hooks/ and exit.
     if args.install_hook:
         from pwnguard.installer import install_hook
         sys.exit(install_hook())
+    if args.uninstall_hook:
+        from pwnguard.installer import uninstall_hook
+        sys.exit(uninstall_hook())
 
     # --self-test short-circuits every other flag: it doesn't touch the
     # AI backend, doesn't read a diff, doesn't load yaml. Run pytest

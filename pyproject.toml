@@ -9,7 +9,7 @@ description = "AI-powered security review for git workflows"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
-authors = [{ name = "Shiva Kerdel" }]
+authors = [{ name = "Power to Logic", email = "support@powertologic.com" }]
 dependencies = ["pyyaml>=6,<7"]
 classifiers = [
   "Development Status :: 3 - Alpha",

@@ -1,20 +1,39 @@
 # PwnGuard
 
 > **Status: Proof of Concept (`v0.2.4`).**
-> PwnGuard is published as a reference / portfolio piece. It works
-> end-to-end, but the config schema, prompt format, and CLI flags may
-> change without notice before a `1.0` release. Don't rely on it as
-> your only line of defence.
+> PwnGuard is an open-source security tool by Shiva Kerdel (Power to Logic).
+> It flags risky code when committing your work, so issues surface during
+> development instead of in production. Proof of concept: flags and config
+> may change before `1.0`. It points you in the right direction, but it's
+> not a substitute for proper security review.
 
 AI-powered security review for your git workflow. Catches insecure code
 before it gets your organization pwned. Runs as a pre-commit hook, in
 CI/CD, or against open merge requests / pull requests.
 
-Scans git diffs (not full repos) for security issues. Installs
-automatically via `composer install`.
+Scans git diffs (not full repos) for security issues.
+
+## Quick start
+
+```bash
+pipx install pwnguard       # or: uv tool install pwnguard
+cd your-project
+pwnguard --install-hook     # scans staged changes on every git commit
+```
+
+Needs Python 3.9+ and one backend — the `claude` CLI, a local Ollama
+server, or an API key. See [Setup](#setup) for the full picture.
+
+To remove it again:
+
+```bash
+pwnguard --uninstall-hook   # run inside any repo where you installed the hook
+pipx uninstall pwnguard     # removes the CLI itself
+```
 
 ## Table of contents
 
+- [Quick start](#quick-start)
 - [What it does](#what-it-does)
 - [Current focus](#current-focus)
 - [Backends](#backends)
@@ -32,6 +51,7 @@ automatically via `composer install`.
 - [Limitations](#limitations)
 - [Security](#security)
 - [Further documentation](#further-documentation)
+- [Acknowledgments](#acknowledgments)
 
 ## What it does
 
@@ -605,3 +625,9 @@ In-depth guides live under `docs/`:
 - [Monitor mode (`--monitor`)](docs/monitor-mode.md) — dashboard for watching remote repos and auditing each new commit as it lands.
 - [Choosing an Ollama model & handling large diffs](docs/ollama-guide.md) — local-model picks by VRAM tier, plus the chunked-mode trade-off when a diff overflows the context window.
 - [Development & testing](docs/development.md) — running the pytest suite, the `--self-test` entry point, and the pre-commit auto-run for this repo.
+
+## Acknowledgments
+
+PwnGuard is built and maintained by [Power to Logic](https://powertologic.com),
+originally created at [Let's Talk](https://www.letstalk.nl) and open-sourced with
+their kind permission.
