@@ -6,7 +6,7 @@
 git commit
     |
     v
-pre-commit hook runs audit.py
+pre-commit hook runs `pwnguard --mode hook`
     |
     v
 Extracts staged diff (only changed files)

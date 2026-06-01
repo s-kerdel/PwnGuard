@@ -11,7 +11,7 @@ heads-up that something landed, then validate manually.
 Open the dashboard:
 
 ```bash
-python3 audit.py --monitor
+pwnguard --monitor
 ```
 
 State is cached in `.pwnguard-monitor.json` in the current working
@@ -81,7 +81,7 @@ release.
 
 ## Verifying the model is actually running (`--debug`)
 
-`python3 audit.py --monitor --debug` keeps the dashboard, but pressing
+`pwnguard --monitor --debug` keeps the dashboard, but pressing
 `r` temporarily drops out of the TUI so the backend's live token
 stream prints to your normal terminal (same streaming output you'd
 see from `--debug` on a regular scan). When the refresh finishes you

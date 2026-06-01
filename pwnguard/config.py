@@ -134,7 +134,9 @@ def _maybe_load_env_files(explicit_path: Optional[str]) -> None:
         n = _load_env_file(explicit_path)
         if n > 0:
             sources.append(f"{explicit_path} ({n})")
-    for path in (".pwnguard.env", ".env"):
+    project_paths = (".pwnguard.env", ".env")
+    home_path = os.path.expanduser("~/.config/pwnguard/.pwnguard.env")
+    for path in (*project_paths, home_path):
         n = _load_env_file(path)
         if n > 0:
             sources.append(f"{path} ({n})")

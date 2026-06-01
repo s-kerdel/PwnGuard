@@ -21,8 +21,30 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
+def _require_git_repo() -> None:
+    """Exit cleanly when the current directory isn't inside a git work tree.
+
+    Without this, ``git diff --cached`` outside a repo falls back to
+    ``--no-index`` mode and dumps git's verbose usage manual to stderr,
+    which is confusing as a PwnGuard error.
+    """
+    check = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True, timeout=GIT_TIMEOUT,
+    )
+    if check.returncode != 0 or check.stdout.strip() != "true":
+        sys.exit(
+            "PwnGuard: not inside a git repository.\n"
+            "  Run from a git project, or scan without git via one of:\n"
+            "    pwnguard --mode manual --files <path> [<path> ...]\n"
+            "    pwnguard --diff-file <path>\n"
+            "    pwnguard --from-url <gitlab-or-github-url>"
+        )
+
+
 def get_staged_diff() -> str:
     """Get the diff of staged files (for pre-commit hook)."""
+    _require_git_repo()
     result = subprocess.run(
         ["git", "diff", "--cached", "--diff-filter=ACMR", "-U3"],
         capture_output=True, text=True, timeout=GIT_TIMEOUT,
@@ -34,6 +56,7 @@ def get_staged_diff() -> str:
 
 def get_mr_diff() -> str:
     """Get the diff against the MR target branch (for CI)."""
+    _require_git_repo()
     # Detect target branch from GitLab CI environment (attacker-influenced).
     target = os.environ.get("CI_MERGE_REQUEST_TARGET_BRANCH_NAME", "main")
     if not _is_safe_ref(target):

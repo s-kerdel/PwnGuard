@@ -9,11 +9,13 @@ repair stages, diff input validation, box-card width math, the
 security primitives (`_sanitize`, `_is_safe_ref`), the CI-gate
 dataclass methods (`AuditResult.exceeds_threshold` etc.), the
 `filter_diff` ignore-pattern + language-focus + truncation paths,
-and `--from-url` routing. Install the dev deps and run pytest from
-the project root:
+and `--from-url` routing. Set up an editable install with the dev
+extras, then run pytest from the project root:
 
 ```bash
-pip install --user -r requirements-dev.txt
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
 python3 -m pytest tests/ -v
 ```
 
@@ -35,9 +37,11 @@ catch separately.
 
 Two convenience entry points:
 
-- `python3 audit.py --self-test` — same suite, callable from anywhere
-  an install of PwnGuard is reachable. Useful for verifying a fresh
-  install is healthy.
+- `pwnguard --self-test` — same suite, callable from anywhere the
+  `pwnguard` CLI is reachable. Useful for verifying a fresh install
+  is healthy. Requires `pytest` in the active environment
+  (`pip install -e ".[dev]"` for an editable clone, or
+  `pipx inject pwnguard pytest` for a pipx install).
 - **Pre-commit auto-run (PwnGuard's own repo only)** — when this
   repo's pre-commit hook fires, it runs `pytest tests/` *before* the
   security scan. Test failures block the commit, since a regressed

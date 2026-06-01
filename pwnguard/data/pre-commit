@@ -1,0 +1,65 @@
+#!/bin/sh
+#
+# PwnGuard pre-commit hook (PWNGUARD_HOOK_V3)
+# AI-powered security review for staged changes.
+#
+# Installed by `pwnguard --install-hook` from inside your git repo.
+#
+# Skip one commit only:  PWNGUARD_SKIP=1 git commit ...
+# Skip all hooks:        git commit --no-verify
+#
+
+PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$PROJECT_ROOT" ]; then
+    echo "Error: not inside a git repository"
+    exit 1
+fi
+
+# Per-shell escape hatch, separate from --no-verify (which skips ALL hooks).
+if [ "${PWNGUARD_SKIP:-0}" = "1" ]; then
+    exit 0
+fi
+
+if ! command -v pwnguard >/dev/null 2>&1; then
+    echo "PwnGuard: 'pwnguard' command not found on PATH."
+    echo "  Install with one of:"
+    echo "    pipx install pwnguard"
+    echo "    uv tool install pwnguard"
+    echo "    pip install pwnguard       (inside a venv)"
+    echo "Skipping security audit for this commit."
+    exit 0
+fi
+
+# Self-test: when committing changes to PwnGuard's own repo (standalone
+# layout: audit.py at repo root AND tests/ present), run the bundled
+# pytest suite before the security scan. A regressed auditor produces
+# unreliable findings. This branch never fires for consumer repos.
+if [ -f "$PROJECT_ROOT/audit.py" ] && [ -f "$PROJECT_ROOT/tests/test_anchors.py" ]; then
+    if python3 -c "import pytest" 2>/dev/null; then
+        echo "PwnGuard: running internal test suite..."
+        python3 -m pytest "$PROJECT_ROOT/tests/" --quiet
+        TEST_EXIT=$?
+        if [ $TEST_EXIT -ne 0 ]; then
+            echo ""
+            echo "Commit blocked: PwnGuard internal tests failed (exit $TEST_EXIT)."
+            echo "Fix failures, or skip with: git commit --no-verify"
+            echo ""
+            exit 1
+        fi
+    else
+        echo "PwnGuard: pytest not installed; skipping internal test suite."
+        echo "  pip install -e \".[dev]\""
+    fi
+fi
+
+pwnguard --mode hook "$@"
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -eq 1 ]; then
+    echo ""
+    echo "Commit blocked by PwnGuard."
+    echo "Fix the findings above, or skip with: git commit --no-verify"
+    echo ""
+fi
+
+exit $EXIT_CODE

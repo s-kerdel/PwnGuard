@@ -81,7 +81,8 @@ def _run_self_test() -> int:
     except ImportError:
         print(
             ui.red("Error:") + " pytest is not installed. Install dev deps:\n"
-            "  pip install --user -r requirements-dev.txt",
+            "  pip install -e \".[dev]\"   (inside a venv, from the repo root)\n"
+            "  pipx inject pwnguard pytest   (if you installed via pipx)",
             file=sys.stderr,
         )
         return 2
@@ -93,52 +94,49 @@ def _run_self_test() -> int:
     return result.returncode
 
 
+class _WideHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """argparse formatter with a wider gap between flag and description."""
+
+    def __init__(self, prog, **kwargs):
+        super().__init__(prog, max_help_position=32, **kwargs)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="pwnguard",
         description="PwnGuard: AI-powered security audit for git commits",
+        epilog=(
+            "Examples:\n"
+            "  pwnguard --install-hook                        Install the pre-commit hook in the current git repo\n"
+            "  pwnguard --mode manual --files src/Foo.py      Scan one or more files manually\n"
+            "  pwnguard --from-url <gitlab-mr-url>            Audit a remote MR/PR via API\n"
+            "  pwnguard --diff-file branch.diff --review      Walk findings interactively from a saved diff\n"
+            "  pwnguard --monitor                             Open the watch-repos dashboard\n"
+            "\n"
+            "Config: pwnguard.yaml + .pwnguard.env in the project root (none required; defaults work).\n"
+            "Docs:   https://github.com/s-kerdel/PwnGuard"
+        ),
+        formatter_class=_WideHelpFormatter,
     )
     parser.add_argument(
         "--version",
         action="version",
         version=f"PwnGuard {__version__}",
     )
-    parser.add_argument(
+
+    source_group = parser.add_argument_group("Source")
+    source_group.add_argument(
         "--mode",
         choices=["hook", "ci", "manual"],
         default="hook",
         help="Run mode: hook (pre-commit), ci (GitLab pipeline), manual (specific files)",
     )
-    parser.add_argument(
-        "--backend",
-        choices=["claude-code", "ollama", "claude-api", "openai-compat"],
-        default=None,
-        help="AI backend (default: claude-code for hook, ollama for ci)",
-    )
-    parser.add_argument(
-        "--model",
-        help="Override model (e.g. qwen2.5-coder:14b, claude-opus-4-7, claude-sonnet-4-6)",
-    )
-    parser.add_argument("--config", help="Path to config file")
-    parser.add_argument(
+    source_group.add_argument(
         "--files",
         nargs="+",
         help="Specific files to scan (manual mode only)",
     )
-    parser.add_argument(
-        "--mr-diff",
-        action="store_true",
-        help="Use MR diff instead of staged diff (CI mode)",
-    )
-    parser.add_argument(
-        "--diff-file",
-        metavar="PATH",
-        help=(
-            "Read a unified diff from PATH instead of running git. "
-            "Handy for offline testing against arbitrary diffs."
-        ),
-    )
-    parser.add_argument(
+    source_group.add_argument(
         "--from-url",
         metavar="URL",
         help=(
@@ -147,69 +145,31 @@ def main():
             "GITHUB_TOKEN is optional for public repos."
         ),
     )
-    parser.add_argument(
-        "--env-file",
-        metavar="PATH",
-        help=(
-            "Load KEY=VALUE pairs from PATH into the environment. "
-            ".env and .pwnguard.env in the current directory are also "
-            "auto-loaded; existing process env vars always take precedence."
-        ),
+
+    backend_group = parser.add_argument_group("Backend")
+    backend_group.add_argument(
+        "--backend",
+        choices=["claude-code", "ollama", "claude-api", "openai-compat"],
+        default=None,
+        help="AI backend (default: claude-code for hook, ollama for ci)",
     )
-    parser.add_argument(
+    backend_group.add_argument(
+        "--model",
+        help="Override model (e.g. qwen2.5-coder:14b, claude-opus-4-7, claude-sonnet-4-6)",
+    )
+
+    output_group = parser.add_argument_group("Output")
+    output_group.add_argument(
         "--json",
         action="store_true",
         help="Output raw JSON instead of formatted text",
     )
-    parser.add_argument(
-        "--show-observations",
-        action="store_true",
-        help=(
-            "Also surface a short list of neutral observations about "
-            "defensive patterns the model noticed in the diff (e.g. "
-            "'parameterised query', 'output escaped'). Opt-in only, "
-            "additive: never replaces findings, never claims code is "
-            "secure. Adds a small number of prompt + output tokens."
-        ),
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be sent to AI without sending",
-    )
-    parser.add_argument(
-        "--threshold",
-        choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
-        help="Override severity threshold from config",
-    )
-    # New presentation / interaction flags
-    parser.add_argument(
+    output_group.add_argument(
         "--quiet",
         action="store_true",
         help="One-line-per-finding output (good for terse CI logs)",
     )
-    parser.add_argument(
-        "--no-color",
-        action="store_true",
-        help="Disable ANSI color and hyperlinks",
-    )
-    parser.add_argument(
-        "--review",
-        action="store_true",
-        help="Walk through findings interactively after the scan",
-    )
-    parser.add_argument(
-        "--explain",
-        metavar="N",
-        type=int,
-        help="Re-query the AI for a deeper explanation of finding N (1-based)",
-    )
-    parser.add_argument(
-        "--report",
-        metavar="PATH",
-        help="Write findings as a markdown report to PATH",
-    )
-    parser.add_argument(
+    output_group.add_argument(
         "--code-preview",
         choices=["auto", "on", "off"],
         default="auto",
@@ -222,7 +182,109 @@ def main():
             "entirely."
         ),
     )
-    parser.add_argument(
+    output_group.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Stream the model's output live to stderr instead of showing "
+            "the spinner. Also prints per-request stats (token count, "
+            "speed, stop reason). Useful when scans return empty or "
+            "stop unexpectedly."
+        ),
+    )
+
+    policy_group = parser.add_argument_group("Policy")
+    policy_group.add_argument(
+        "--threshold",
+        choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
+        help="Override severity threshold from config",
+    )
+    policy_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be sent to AI without sending",
+    )
+    policy_group.add_argument(
+        "--review",
+        action="store_true",
+        help="Walk through findings interactively after the scan",
+    )
+    policy_group.add_argument(
+        "--chunk-per-file",
+        action="store_true",
+        help=(
+            "Split the diff at `diff --git` boundaries and scan each file "
+            "separately, then merge findings. Useful when the full diff "
+            "exceeds the local model's context window - keeps each request "
+            "small enough to fit in num_ctx. Adds wall time (one AI call "
+            "per file) but avoids silent truncation."
+        ),
+    )
+
+    advanced_group = parser.add_argument_group("Advanced")
+    advanced_group.add_argument(
+        "--diff-file",
+        metavar="PATH",
+        help=(
+            "Read a unified diff from PATH instead of running git. "
+            "Handy for offline testing against arbitrary diffs."
+        ),
+    )
+    advanced_group.add_argument(
+        "--mr-diff",
+        action="store_true",
+        help="Use MR diff instead of staged diff (CI mode)",
+    )
+    advanced_group.add_argument("--config", help="Path to config file")
+    advanced_group.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color and hyperlinks",
+    )
+    advanced_group.add_argument(
+        "--report",
+        metavar="PATH",
+        help="Write findings as a markdown report to PATH",
+    )
+    advanced_group.add_argument(
+        "--show-observations",
+        action="store_true",
+        help=(
+            "Also surface a short list of neutral observations about "
+            "defensive patterns the model noticed in the diff (e.g. "
+            "'parameterised query', 'output escaped'). Opt-in only, "
+            "additive: never replaces findings, never claims code is "
+            "secure. Adds a small number of prompt + output tokens."
+        ),
+    )
+    advanced_group.add_argument(
+        "--explain",
+        metavar="N",
+        type=int,
+        help="Re-query the AI for a deeper explanation of finding N (1-based)",
+    )
+    advanced_group.add_argument(
+        "--env-file",
+        metavar="PATH",
+        help=(
+            "Load KEY=VALUE pairs from PATH into the environment. "
+            ".env and .pwnguard.env in the current directory are also "
+            "auto-loaded; existing process env vars always take precedence."
+        ),
+    )
+    advanced_group.add_argument(
+        "--self-test",
+        action="store_true",
+        help=(
+            "Run PwnGuard's bundled test suite (anchor pipeline, JSON "
+            "parser repair, diff validation, box-card width math) and "
+            "exit with pytest's status code. Useful for verifying that "
+            "an install is healthy. Requires pytest "
+            "(pip install -e \".[dev]\" inside a venv, or pipx inject "
+            "pwnguard pytest)."
+        ),
+    )
+    advanced_group.add_argument(
         "--ollama-format",
         choices=["json", "raw"],
         default="json",
@@ -234,39 +296,7 @@ def main():
             "JSON in markdown or adds preamble."
         ),
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help=(
-            "Stream the model's output live to stderr instead of showing "
-            "the spinner. Also prints per-request stats (token count, "
-            "speed, stop reason). Useful when scans return empty or "
-            "stop unexpectedly."
-        ),
-    )
-    parser.add_argument(
-        "--chunk-per-file",
-        action="store_true",
-        help=(
-            "Split the diff at `diff --git` boundaries and scan each file "
-            "separately, then merge findings. Useful when the full diff "
-            "exceeds the local model's context window - keeps each request "
-            "small enough to fit in num_ctx. Adds wall time (one AI call "
-            "per file) but avoids silent truncation."
-        ),
-    )
-    parser.add_argument(
-        "--self-test",
-        action="store_true",
-        help=(
-            "Run PwnGuard's bundled test suite (anchor pipeline, JSON "
-            "parser repair, diff validation, box-card width math) and "
-            "exit with pytest's status code. Useful for verifying that "
-            "an install is healthy. Requires pytest "
-            "(pip install --user -r requirements-dev.txt)."
-        ),
-    )
-    parser.add_argument(
+    advanced_group.add_argument(
         "--monitor",
         action="store_true",
         help=(
@@ -278,7 +308,35 @@ def main():
         ),
     )
 
+    setup_group = parser.add_argument_group("Setup")
+    setup_group.add_argument(
+        "--install-hook",
+        action="store_true",
+        help=(
+            "Install PwnGuard's pre-commit hook into the current git "
+            "repository's .git/hooks/pre-commit. Run from inside the "
+            "repository you want to protect."
+        ),
+    )
+
+    # Bare `pwnguard` with no flags: show help without the Advanced
+    # group, then point at `--help` for the full reference. Without
+    # this, `--mode hook` is the default and the user falls through
+    # to a git error when there's no staged diff (or no repo at all).
+    if len(sys.argv) == 1:
+        parser._action_groups.remove(advanced_group)
+        parser.print_help()
+        print("\nRun `pwnguard --help` for advanced flags.")
+        sys.exit(0)
+
     args = parser.parse_args()
+
+    # --install-hook short-circuits every other flag: no backend, no
+    # diff, no yaml load. Drop the bundled pre-commit script into the
+    # current repo's .git/hooks/ and exit.
+    if args.install_hook:
+        from pwnguard.installer import install_hook
+        sys.exit(install_hook())
 
     # --self-test short-circuits every other flag: it doesn't touch the
     # AI backend, doesn't read a diff, doesn't load yaml. Run pytest

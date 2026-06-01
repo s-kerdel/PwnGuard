@@ -18,11 +18,11 @@ pwnguard:
   rules:
     - if: $CI_MERGE_REQUEST_IID
   before_script:
-    - pip install pyyaml --quiet
+    - pip install pwnguard --quiet
     # Ensure Ollama is running on the runner
     - ollama list || echo "Warning: Ollama not available"
   script:
-    - python pwnguard/audit.py --mode ci --mr-diff --backend ollama
+    - pwnguard --mode ci --mr-diff --backend ollama
   allow_failure: false
 
 # --- Option B: Claude API (if org has API access) ---
@@ -38,7 +38,7 @@ pwnguard:
 #     paths:
 #       - .pip-cache/
 #   before_script:
-#     - pip install anthropic pyyaml --quiet
+#     - pip install "pwnguard[claude-api]" --quiet
 #   script:
-#     - python pwnguard/audit.py --mode ci --mr-diff --backend claude-api
+#     - pwnguard --mode ci --mr-diff --backend claude-api
 #   allow_failure: false

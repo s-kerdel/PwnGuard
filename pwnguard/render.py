@@ -589,7 +589,11 @@ def _print_footer(result: AuditResult, threshold: str) -> None:
     """Result label (PASS/FAIL) + actionable next step."""
     if result.exceeds_threshold(threshold):
         label = ui.bold(ui.red("FAIL"))
-        n = len(result.blocking_findings)
+        threshold_rank = SEVERITY_ORDER.get(threshold, 3)
+        n = sum(
+            1 for f in result.blocking_findings
+            if SEVERITY_ORDER.get(f.severity, 0) >= threshold_rank
+        )
         print(f"{label}  Fix the {n} issue{'s' if n != 1 else ''} above, then `{ui.bold('git commit')}`.")
         print(f"      Bypass once: {ui.dim('PWNGUARD_SKIP=1 git commit')}")
     else:

@@ -1,6 +1,6 @@
 # PwnGuard
 
-> **Status: Proof of Concept (`v0.2.3`).**
+> **Status: Proof of Concept (`v0.2.4`).**
 > PwnGuard is published as a reference / portfolio piece. It works
 > end-to-end, but the config schema, prompt format, and CLI flags may
 > change without notice before a `1.0` release. Don't rely on it as
@@ -19,6 +19,7 @@ automatically via `composer install`.
 - [Current focus](#current-focus)
 - [Backends](#backends)
 - [Setup](#setup)
+- [Configuration files](#configuration-files)
 - [Common workflows](#common-workflows)
 - [CLI reference](#cli-reference)
 - [Configuration reference (`pwnguard.yaml`)](#configuration-reference-pwnguardyaml)
@@ -77,24 +78,54 @@ For picking an Ollama model by VRAM tier, see
 
 ## Setup
 
-### 1. Add to your project
+### 1. Install PwnGuard
 
-Copy the `pwnguard/` folder into your project root.
+Recommended (isolated CLI on PATH, no PEP 668 friction):
 
-### 2. Merge into `composer.json`
+```bash
+pipx install pwnguard
+# or:
+uv tool install pwnguard
+```
 
-Add to your existing `composer.json` scripts section:
+Or into a project venv:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install pwnguard
+```
+
+For the Anthropic API backend, pull in the optional dependency:
+
+```bash
+pipx install "pwnguard[claude-api]"
+# or, on an existing pipx install:
+pipx inject pwnguard anthropic
+```
+
+### 2. Install the pre-commit hook
+
+From the root of the git repository you want to protect:
+
+```bash
+pwnguard --install-hook
+```
+
+Every `git commit` now scans the staged diff. The hook is per-clone, so
+each contributor runs this once after cloning the project.
+
+### Optional: composer auto-install (PHP projects)
+
+To install the hook automatically when each developer runs
+`composer install`, add to your `composer.json`:
 
 ```json
 {
     "scripts": {
-        "setup-pwnguard": "python3 pwnguard/install-hook.py || python pwnguard/install-hook.py || echo '[pwnguard] Python not found'",
-        "post-install-cmd": [
-            "@setup-pwnguard"
-        ],
-        "post-update-cmd": [
-            "@setup-pwnguard"
-        ]
+        "setup-pwnguard": "pwnguard --install-hook || echo '[pwnguard] not installed; run: pipx install pwnguard'",
+        "post-install-cmd": ["@setup-pwnguard"],
+        "post-update-cmd": ["@setup-pwnguard"]
     }
 }
 ```
@@ -102,32 +133,54 @@ Add to your existing `composer.json` scripts section:
 If you already have a `post-install-cmd`, add `"@setup-pwnguard"` to the
 existing array.
 
-### 3. Run `composer install`
-
-```bash
-composer install
-```
-
-The pre-commit hook is now installed. Every developer who runs
-`composer install` gets it automatically.
-
 ### Requirements
 
-- Python 3.9+ (uses builtin-generic syntax like `list[Finding]`; Python 2 is **not** supported, EOL since 2020)
-- `pyyaml==6.0.2` (install with `pip install --user pyyaml`)
-- One of: Claude Code CLI, an Ollama server, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` (for any OpenAI-compatible endpoint)
+Python 3.9+ and **one** of the backends below — pick the row that matches
+your situation. Anything not in the "Required setup" column is optional;
+PwnGuard ships with sensible defaults for every other knob.
 
-For running the test suite and the `--self-test` entry point, see
+| Your situation | Required setup |
+|---|---|
+| Default: `claude` CLI is logged in **or** Ollama is running locally | Nothing else — `pwnguard` auto-detects and uses built-in defaults |
+| Anthropic API backend | `ANTHROPIC_API_KEY` env var (or a line in `.pwnguard.env`); `pipx install "pwnguard[claude-api]"` to pull in the `anthropic` package |
+| Any OpenAI-compatible endpoint (LiteLLM, vLLM, OpenRouter, Groq, …) | `OPENAI_API_KEY` env var **and** an `openai:` block in `pwnguard.yaml` setting `url` and `model` |
+| Scanning a GitLab MR / GitHub PR via `--from-url` | `GITLAB_TOKEN` (required for GitLab) and/or `GITHUB_TOKEN` (required for private GitHub repos) |
+| Monitor mode (`--monitor`) | A `monitor.repos:` block in `pwnguard.yaml` — see [docs/monitor-mode.md](docs/monitor-mode.md) |
+| Custom severity threshold, ignore patterns, model, etc. | A `pwnguard.yaml` containing only the keys you want to override — deep-merged on top of defaults |
+
+For developing PwnGuard itself or running the test suite, see
 [docs/development.md](docs/development.md).
+
+## Configuration files
+
+PwnGuard auto-loads config from the current working directory at startup —
+the same directory `git commit` runs in, so the pre-commit hook picks up
+project-local files automatically. **None of these files are required**;
+without any of them, built-in defaults kick in and a one-line notice
+prints to stderr.
+
+| File | Purpose | Committed? |
+|---|---|---|
+| `pwnguard.yaml` (or `.pwnguard.yaml`) | Project config shared with the team | Yes |
+| `pwnguard.local.yaml` (or `.pwnguard.local.yaml`) | Personal overrides, deep-merged on top of `pwnguard.yaml` | No (already in `.gitignore`) |
+| `.pwnguard.env` | API tokens as `KEY=value` lines | No (already in `.gitignore`) |
+| `.env` | Generic env file, lower precedence than `.pwnguard.env` | No |
+| `~/.config/pwnguard/config.yaml` | Global yaml fallback across every project | n/a (home dir) |
+| `~/.config/pwnguard/.pwnguard.env` | Global token fallback across every project | n/a (home dir) |
+
+**Precedence** (highest wins): `--config <PATH>` / `--env-file <PATH>` CLI flags
+→ process env vars → project file → home-dir file → built-in defaults.
+`pwnguard.local.yaml` is always deep-merged on top of whichever yaml loaded.
+
+Starter templates for `pwnguard.yaml` and `.pwnguard.env.example` live in
+the [GitHub repo](https://github.com/s-kerdel/PwnGuard); copy the keys you
+need rather than the whole file.
 
 ## Common workflows
 
-> **Invocation path.** The examples below use `python3 pwnguard/audit.py` —
-> the layout you get after `composer install` drops the `pwnguard/`
-> directory into your project. If you're running directly from a clone of
-> this repository, the entry point is at the root, so use
-> `python3 audit.py` (drop the `pwnguard/` prefix). The pre-commit hook
-> auto-detects both layouts; only manual invocations differ.
+> All examples below use the installed `pwnguard` CLI (from
+> `pipx install pwnguard`). The pre-commit hook installed by
+> `pwnguard --install-hook` runs the same command under the hood.
 
 ### Local pre-commit (default)
 Hook fires automatically on `git commit`. Scans only the staged diff.
@@ -139,45 +192,45 @@ git commit -m "feat: add user lookup"
 
 ### Manual scan of one or more files
 ```bash
-python3 pwnguard/audit.py --mode manual --files src/Foo.php src/Bar.php
+pwnguard --mode manual --files src/Foo.php src/Bar.php
 ```
 
 ### Scan a GitLab merge request
 ```bash
 export GITLAB_TOKEN=glpat-...
-python3 pwnguard/audit.py --from-url "https://gitlab.com/grp/proj/-/merge_requests/123"
+pwnguard --from-url "https://gitlab.com/grp/proj/-/merge_requests/123"
 ```
 
 ### Scan only one commit of a large MR
 ```bash
-python3 pwnguard/audit.py --from-url \
+pwnguard --from-url \
   "https://gitlab.com/grp/proj/-/merge_requests/123/diffs?commit_id=abc1234def"
 ```
 
 ### Scan a GitHub pull request
 ```bash
 export GITHUB_TOKEN=ghp_...   # optional for public repos, required for private
-python3 pwnguard/audit.py --from-url "https://github.com/owner/repo/pull/42"
+pwnguard --from-url "https://github.com/owner/repo/pull/42"
 ```
 
 ### Offline review of a saved diff
 ```bash
 git diff origin/main...HEAD > /tmp/branch.diff
-python3 pwnguard/audit.py --diff-file /tmp/branch.diff --review
+pwnguard --diff-file /tmp/branch.diff --review
 ```
 
 ### Interactive walk through findings
 ```bash
-python3 pwnguard/audit.py --from-url "<URL>" --review
+pwnguard --from-url "<URL>" --review
 # Use arrow keys to navigate, right/left to expand/collapse,
 # space to mark, q to quit. Full key bindings: docs/review-tui.md
 ```
 
 ### Watch what the model is doing in real time
 ```bash
-python3 pwnguard/audit.py --backend ollama --files src/Foo.php --debug
+pwnguard --backend ollama --files src/Foo.php --debug
 # Or against any OpenAI-compatible endpoint (LiteLLM, vLLM, etc.):
-python3 pwnguard/audit.py --backend openai-compat --files src/Foo.php --debug
+pwnguard --backend openai-compat --files src/Foo.php --debug
 # Shows a "Waiting for response / Model is thinking" spinner during
 # prompt processing, then streams tokens to stderr as they arrive,
 # then prints per-request stats (tokens, t/s, stop reason).
@@ -185,7 +238,7 @@ python3 pwnguard/audit.py --backend openai-compat --files src/Foo.php --debug
 
 ### Save findings to a Markdown report
 ```bash
-python3 pwnguard/audit.py --from-url "<URL>" --report /tmp/findings.md
+pwnguard --from-url "<URL>" --report /tmp/findings.md
 ```
 
 ### Bypass the hook for one commit
@@ -197,7 +250,7 @@ git commit --no-verify
 
 ## CLI reference
 
-Every flag accepted by `audit.py`. Default values come from
+Every flag accepted by `pwnguard`. Default values come from
 `DEFAULT_CONFIG` unless overridden in `pwnguard.yaml`.
 
 ### Run mode + diff source
