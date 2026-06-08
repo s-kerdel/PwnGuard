@@ -1,6 +1,6 @@
 # PwnGuard
 
-> **Status: Proof of Concept (`v0.2.4`).**
+> **Status: Proof of Concept (`v0.2.5`).**
 > PwnGuard is an open-source security tool by Shiva Kerdel (Power to Logic).
 > It flags risky code when committing your work, so issues surface during
 > development instead of in production. Proof of concept: flags and config
@@ -298,6 +298,7 @@ Every flag accepted by `pwnguard`. Default values come from
 | `--json` | off | Emit findings as JSON on stdout. Mutually useful with `--dry-run` / piping. |
 | `--quiet` | off | One-line-per-finding output. Good for terse CI logs. |
 | `--no-color` | off | Disable ANSI color and OSC 8 hyperlinks. Also auto-disabled when stdout is not a TTY or when `NO_COLOR` is set. |
+| `--color` | off | Force color and hyperlinks on even when stdout is not a TTY - needed when a git hook manager or `composer run-script` captures output through a pipe. Mirrors the `FORCE_COLOR` env var; `--no-color` / `NO_COLOR` win if both are set. In this case the terminal width is read from `/dev/tty` so boxes still fill the screen. |
 | `--code-preview {auto,on,off}` | `auto` | Show the affected-code block + `Example:` fix snippet. `auto` = on for claude backends, off for ollama (smaller models give imprecise line numbers and skip fix examples). |
 | `--report <PATH>` | (none) | Write the findings as a Markdown report to `<PATH>`. |
 | `--debug` | off | Stream the model's output live to stderr (ollama + openai-compat backends). During prompt processing a "Waiting for response..." / "Model is thinking..." spinner shows that the server is active; once tokens start arriving the spinner exits and the stream takes over. Prints per-request stats at the end (token count, tokens-per-second, stop reason). Useful when scans return empty or stop unexpectedly. |
@@ -309,7 +310,8 @@ Every flag accepted by `pwnguard`. Default values come from
 |------|---------|---------|
 | `--threshold {CRITICAL,HIGH,MEDIUM,LOW,INFO}` | from config (`HIGH`) | Severity threshold that blocks (exit 1). |
 | `--dry-run` | off | Show what would be sent to the AI (files, diff size, token estimate) without making the API call. |
-| `--review` | off | After the scan, drop into an interactive TUI to step through findings. See [docs/review-tui.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/review-tui.md). |
+| `--review` | off | After the scan, drop into an interactive TUI to step through findings. See [docs/review-tui.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/review-tui.md). When a hook scan blocks a commit in an interactive terminal, PwnGuard prints a tip to re-run with `--review --cached`. |
+| `--cached` | off | Reuse the most recent scan of the *identical* staged diff instead of re-running the AI - pairs with the `--review` re-run after a hook scan. Content-keyed on diff + backend + model + pwnguard version, stored in `.git/pwnguard-scan-cache.json`; any change misses and re-scans. Falls back to a fresh scan on any miss, errored scans are never cached, and the security gate (a bare hook run) never reads it. Staged-diff path only. |
 | `--explain <N>` | (none) | Re-query the AI for a deeper explanation of finding number `N` (1-indexed). Adds one extra AI call. |
 
 ### Performance / handling for large diffs

@@ -120,18 +120,30 @@ def configure(*, color: bool = True) -> None:
     _use_color = color
 
 
-def should_use_color(no_color_flag: bool = False) -> bool:
+def should_use_color(
+    no_color_flag: bool = False, force_color_flag: bool = False
+) -> bool:
     """Decide whether to emit ANSI codes.
 
     Honors, in order of precedence:
       - explicit --no-color flag
       - NO_COLOR env var (https://no-color.org)
+      - explicit --color flag
+      - FORCE_COLOR env var
       - non-TTY stdout (pipes, file redirects, CI logs without a PTY)
+
+    The force path exists for git hook managers and CI runners that
+    capture stdout through a pipe: stdout is not a TTY there, but the
+    output is still rendered to a terminal that understands ANSI.
     """
     if no_color_flag:
         return False
     if os.environ.get("NO_COLOR"):
         return False
+    if force_color_flag:
+        return True
+    if os.environ.get("FORCE_COLOR"):
+        return True
     if not sys.stdout.isatty():
         return False
     return True
@@ -250,12 +262,34 @@ def file_link(rel_path: str, line: Optional[int] = None) -> str:
 # Layout helpers
 # ---------------------------------------------------------------------------
 
-def term_width(default: int = 80) -> int:
-    """Detected terminal width, with a sane lower bound."""
+def _tty_size():
+    """Window size of the controlling terminal via /dev/tty, or None.
+
+    Reached when stdout is not a TTY - a git hook manager or CI runner
+    capturing output through a pipe - so the real terminal dimensions
+    are still found instead of the 80x24 fallback.
+    """
     try:
-        cols = shutil.get_terminal_size((default, 24)).columns
+        with open("/dev/tty") as tty:
+            return os.get_terminal_size(tty.fileno())
+    except (OSError, ValueError):
+        return None
+
+
+def term_width(default: int = 80) -> int:
+    """Detected terminal width, with a sane lower bound.
+
+    Trusts stdout's width first (honoring the COLUMNS env var via
+    shutil); when stdout is a pipe, falls back to the controlling
+    terminal through /dev/tty before the default.
+    """
+    try:
+        cols = shutil.get_terminal_size((0, 24)).columns
     except OSError:
-        cols = default
+        cols = 0
+    if cols <= 0:
+        size = _tty_size()
+        cols = size.columns if size else default
     return max(40, cols)
 
 
@@ -264,13 +298,35 @@ def term_height(default: int = 24) -> int:
 
     Used by the review TUI to decide how many findings can fit on
     screen at once so the cursor's expanded card never scrolls past
-    the visible area.
+    the visible area. Falls back to /dev/tty when stdout is a pipe.
     """
     try:
-        rows = shutil.get_terminal_size((80, default)).lines
+        rows = shutil.get_terminal_size((80, 0)).lines
     except OSError:
-        rows = default
+        rows = 0
+    if rows <= 0:
+        size = _tty_size()
+        rows = size.lines if size else default
     return max(10, rows)
+
+
+def interactive_terminal_available() -> bool:
+    """True when a controlling terminal exists to run the review TUI.
+
+    Gates the ``--review`` tip after a hook scan. Uses /dev/tty, not
+    ``stdout.isatty()``: under a hook manager stdout is a pipe but the
+    terminal is still reachable to re-run in. False on Windows (no
+    cbreak TUI) and on GUI/CI commits (no controlling terminal).
+    """
+    if not CbreakTerminal.available:
+        return False
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return True
+    try:
+        with open("/dev/tty"):
+            return True
+    except OSError:
+        return False
 
 
 # Strips both SGR (colors) and OSC 8 hyperlink sequences so visible_len()

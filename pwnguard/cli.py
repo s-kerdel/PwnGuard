@@ -210,6 +210,15 @@ def main():
         help="Walk through findings interactively after the scan",
     )
     policy_group.add_argument(
+        "--cached",
+        action="store_true",
+        help=(
+            "Reuse the most recent scan of the identical staged diff "
+            "instead of re-running the AI (falls back to a fresh scan on "
+            "any miss). Pairs with --review after a hook scan."
+        ),
+    )
+    policy_group.add_argument(
         "--chunk-per-file",
         action="store_true",
         help=(
@@ -240,6 +249,16 @@ def main():
         "--no-color",
         action="store_true",
         help="Disable ANSI color and hyperlinks",
+    )
+    advanced_group.add_argument(
+        "--color",
+        action="store_true",
+        help=(
+            "Force ANSI color and hyperlinks on even when stdout is not "
+            "a TTY, e.g. when a git hook manager or CI captures output "
+            "through a pipe. Mirrors the FORCE_COLOR env var; --no-color "
+            "wins if both are given."
+        ),
     )
     advanced_group.add_argument(
         "--report",
@@ -357,7 +376,9 @@ def main():
         sys.exit(_run_self_test())
 
     # Configure UI before any styled output.
-    ui.configure(color=ui.should_use_color(no_color_flag=args.no_color))
+    ui.configure(color=ui.should_use_color(
+        no_color_flag=args.no_color, force_color_flag=args.color,
+    ))
 
     # Load env vars before anything that might need them (tokens for
     # --from-url, ANTHROPIC_API_KEY for claude-api, GITLAB_TOKEN for
@@ -530,6 +551,17 @@ def main():
             result, threshold, diff_lines,
             files_scanned=files_scanned, quiet=args.quiet,
         )
+        # Point blocked hook commits at the interactive review TUI, but
+        # only when a terminal is reachable to re-run it in.
+        if (
+            args.mode == "hook"
+            and not args.review
+            and result.exceeds_threshold(threshold)
+            and ui.interactive_terminal_available()
+        ):
+            print()
+            print(ui.dim("  Tip: step through findings interactively with"))
+            print(ui.dim("    pwnguard --mode hook --color --review --cached"))
 
     # Optional report file.
     if args.report:

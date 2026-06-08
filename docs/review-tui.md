@@ -6,6 +6,24 @@ Pass `--review` to walk through findings interactively after a scan.
 Uses raw-mode keyboard input on the alternate screen buffer (Unix
 only; gracefully no-ops on Windows or non-TTY).
 
+## Re-running after a hook commit (`--cached`)
+
+When a pre-commit hook scan blocks a commit and you're in an
+interactive terminal, PwnGuard prints a tip suggesting:
+
+```
+pwnguard --mode hook --color --review --cached
+```
+
+The hook already scanned the staged diff; `--cached` reuses that result
+instead of paying for a second AI call, then opens this TUI. The cache
+is content-keyed (diff + backend + model + pwnguard version) and stored
+in `.git/pwnguard-scan-cache.json`, so if you `git add` more files
+before re-running it misses and re-scans rather than showing stale
+findings. The tip only appears when a terminal is reachable to re-run
+in - a git GUI's commit panel (no controlling terminal) and Windows
+(no cbreak TUI) stay silent.
+
 Keys:
 
 | Key | Action |

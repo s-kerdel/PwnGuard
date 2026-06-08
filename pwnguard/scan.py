@@ -7,11 +7,16 @@ the active model's context. ``explain_finding`` re-queries the backend
 for a deeper writeup of a single previously-reported finding.
 """
 
+import hashlib
+import json
+import os
+import subprocess
 import sys
 import urllib.parse
+from dataclasses import asdict
 from typing import Optional
 
-from pwnguard import runtime, ui
+from pwnguard import __version__, runtime, ui
 from pwnguard.anchors import resolve_anchors, wrap_diff
 from pwnguard.backends import dispatch_backend
 from pwnguard.constants import STREAMING_BACKENDS
@@ -30,7 +35,7 @@ from pwnguard.diff import (
     _looks_like_unified_diff,
 )
 from pwnguard.fetchers import fetch_from_url
-from pwnguard.models import AuditResult, Finding
+from pwnguard.models import AuditResult, Finding, Observation
 from pwnguard.parser import parse_response
 from pwnguard.prompts import EXPLAIN_PROMPT_TEMPLATE, build_system_prompt
 from pwnguard.security import _sanitize
@@ -149,6 +154,112 @@ def _run_scan_chunked(
     return merged, total_elapsed
 
 
+# --- Scan cache --------------------------------------------------------
+# Lets a follow-up `--review --cached` reuse the hook's scan instead of
+# re-hitting the AI. Single entry in .git/, content-keyed (so a changed
+# staged diff misses and re-scans), best-effort (never blocks a commit).
+
+_SCAN_CACHE_VERSION = 1
+
+
+def _scan_cache_path() -> Optional[str]:
+    """Path to the per-repo cache file inside .git/, or None if not in a repo."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            capture_output=True, text=True, check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    git_dir = out.stdout.strip()
+    if out.returncode != 0 or not git_dir:
+        return None
+    return os.path.join(git_dir, "pwnguard-scan-cache.json")
+
+
+def _scan_cache_key(diff: str, backend: str, config: dict) -> str:
+    """Hash of everything that changes findings: pwnguard version, diff,
+    backend, model, obs flag. Including the version means an upgrade that
+    changes detection invalidates old entries instead of replaying them."""
+    models = "|".join(
+        str((config.get(sec) or {}).get("model", ""))
+        for sec in ("ollama", "claude_api", "openai")
+    )
+    obs = "1" if runtime.show_observations else "0"
+    payload = "\0".join([__version__, diff, backend, models, obs])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _is_cacheable(args) -> bool:
+    """True only for the staged-diff path. URL / file / manual / CI sources
+    don't share the staged cache, so they neither read nor write it."""
+    return not (
+        getattr(args, "from_url", None)
+        or getattr(args, "diff_file", None)
+        or (getattr(args, "mode", None) == "manual" and getattr(args, "files", None))
+        or getattr(args, "mode", None) == "ci"
+        or getattr(args, "mr_diff", None)
+    )
+
+
+def _result_to_dict(result: AuditResult) -> dict:
+    return {
+        "findings": [asdict(f) for f in result.findings],
+        "observations": [asdict(o) for o in result.observations],
+        "files_scanned": result.files_scanned,
+        "error": result.error,
+        "elapsed": result.elapsed,
+    }
+
+
+def _result_from_dict(data: dict) -> AuditResult:
+    return AuditResult(
+        findings=[Finding(**f) for f in data.get("findings", [])],
+        observations=[Observation(**o) for o in data.get("observations", [])],
+        files_scanned=data.get("files_scanned", 0),
+        error=data.get("error"),
+        elapsed=data.get("elapsed", 0.0),
+    )
+
+
+def _store_scan_cache(key: str, diff: str, result: AuditResult) -> None:
+    """Write the latest scan. Swallows every error so a commit can't fail here.
+    Errored scans aren't cached, so a transient backend failure isn't replayed
+    by a later --cached run instead of being retried."""
+    if result.error:
+        return
+    path = _scan_cache_path()
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"version": _SCAN_CACHE_VERSION, "key": key,
+                 "diff": diff, "result": _result_to_dict(result)},
+                f,
+            )
+    except (OSError, TypeError):
+        pass
+
+
+def _load_scan_cache(key: str) -> Optional[tuple]:
+    """Return (result, diff, diff_lines, files_scanned) on an exact key match,
+    else None. Any missing file / parse error / key mismatch is a miss."""
+    path = _scan_cache_path()
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("version") != _SCAN_CACHE_VERSION or data.get("key") != key:
+            return None
+        diff = data["diff"]
+        result = _result_from_dict(data["result"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return result, diff, parse_diff_lines(diff), len(parse_diff_files(diff))
+
+
 def run_scan(
     args,
     config: dict,
@@ -212,6 +323,17 @@ def run_scan(
     filtered = filter_diff(raw_diff, config, apply_truncation=False)
     if not filtered.strip():
         return AuditResult(), "", {}, 0
+
+    # Key on the pre-truncation diff so write (below) and read use the
+    # same value regardless of the later chunk/truncate decision. Only the
+    # staged-diff path participates in the cache.
+    cacheable = _is_cacheable(args)
+    cache_key = _scan_cache_key(filtered, backend, config)
+    if cacheable and getattr(args, "cached", False):
+        cached = _load_scan_cache(cache_key)
+        if cached is not None:
+            print(ui.dim("PwnGuard: reusing cached scan (--cached)"), file=sys.stderr)
+            return cached
 
     # Diff-size telemetry is always shown so the dev knows what just went
     # over the wire (especially relevant for paid backends).
@@ -367,6 +489,11 @@ def run_scan(
             ),
             file=sys.stderr,
         )
+
+    # Persist for a later --cached run (e.g. the --review re-run), staged
+    # path only so URL/file/CI scans don't leave a stray cache.
+    if cacheable:
+        _store_scan_cache(cache_key, filtered, result)
 
     return result, filtered, diff_lines, len(files)
 
