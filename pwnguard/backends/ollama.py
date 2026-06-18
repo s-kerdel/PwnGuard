@@ -14,7 +14,8 @@ import urllib.parse
 import urllib.request
 
 from pwnguard import runtime, ui
-from pwnguard.constants import SAFE_OLLAMA_HOSTS
+from pwnguard.backends._net import preflight_connect
+from pwnguard.constants import DEFAULT_CONNECT_TIMEOUT, SAFE_OLLAMA_HOSTS
 from pwnguard.prompts import SYSTEM_PROMPT
 from pwnguard.security import _sanitize
 
@@ -78,6 +79,12 @@ def query_ollama(diff: str, config: dict, system_prompt: str = SYSTEM_PROMPT) ->
         f"{url}/api/chat",
         data=payload,
         headers={"Content-Type": "application/json"},
+    )
+
+    # Fail fast if Ollama isn't reachable rather than blocking on `timeout`.
+    preflight_connect(
+        url, ollama_config.get("connect_timeout", DEFAULT_CONNECT_TIMEOUT),
+        "ollama",
     )
 
     try:

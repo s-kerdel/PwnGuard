@@ -25,7 +25,8 @@ import urllib.request
 from typing import Optional
 
 from pwnguard import runtime, ui
-from pwnguard.constants import LOOPBACK_HOSTS
+from pwnguard.backends._net import preflight_connect
+from pwnguard.constants import DEFAULT_CONNECT_TIMEOUT, LOOPBACK_HOSTS
 from pwnguard.prompts import SYSTEM_PROMPT
 from pwnguard.security import _sanitize
 
@@ -152,6 +153,12 @@ def query_openai_compat(diff: str, config: dict, system_prompt: str = SYSTEM_PRO
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         },
+    )
+
+    # Fail fast if the host isn't reachable rather than blocking on `timeout`.
+    preflight_connect(
+        base_url, openai_config.get("connect_timeout", DEFAULT_CONNECT_TIMEOUT),
+        "openai",
     )
 
     try:

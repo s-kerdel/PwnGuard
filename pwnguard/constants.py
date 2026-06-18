@@ -19,6 +19,12 @@ SAFE_OLLAMA_HOSTS = {"localhost", "127.0.0.1", "::1"}
 # to set openai.allow_insecure: true (acknowledging the plaintext risk).
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
+# Seconds to wait on the initial TCP connect to a model host before
+# giving up. Kept short and separate from the (much larger) request
+# timeout so an unreachable local LLM fails fast instead of blocking on
+# the full generation timeout.
+DEFAULT_CONNECT_TIMEOUT = 5
+
 # Backends that actually stream tokens to stderr in --debug mode. The
 # spinner is suppressed for these because the live stream replaces it;
 # for any other backend the spinner stays on in debug mode too so the
@@ -72,6 +78,9 @@ DEFAULT_CONFIG = {
         # appropriate. The Claude backends have their own (shorter)
         # timeout in claude_code.timeout.
         "timeout": 600,
+        # TCP connect timeout (seconds). Short so an unreachable host
+        # fails fast instead of blocking on `timeout` above.
+        "connect_timeout": 5,
         # Optional model tunables forwarded to Ollama's `options` field.
         # Omit any of these to use the model's own default. Common picks:
         #   keep_alive: "30m"  - keep the model resident in VRAM
@@ -87,6 +96,9 @@ DEFAULT_CONFIG = {
         "url": "https://api.openai.com",
         "model": "gpt-4o-mini",
         "timeout": 600,
+        # TCP connect timeout (seconds). Short so an unreachable host
+        # fails fast instead of blocking on `timeout` above.
+        "connect_timeout": 5,
         # API key is read from the OPENAI_API_KEY env var (never the yaml,
         # so the repo stays committable). Override the env var name here
         # if your project uses a different one (e.g. for multiple proxies).
