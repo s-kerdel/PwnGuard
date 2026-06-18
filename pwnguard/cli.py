@@ -42,15 +42,18 @@ from pwnguard.scan import explain_finding, run_scan
 def _run_self_test() -> int:
     """Run the bundled pytest suite against tests/ and return its exit code.
 
-    Looks for the tests directory in three locations, in order:
+    Looks for the tests directory in several locations, in order:
 
       1. Next to the ``audit.py`` shim - standalone layout, the common
          case (the PwnGuard repository itself runs --self-test against
          its own bundled tests/).
-      2. Inside the ``pwnguard/`` package directory - the legacy
+      2. ``pwnguard/_bundled/tests`` - shipped inside the wheel so a
+         pip/pipx install can self-test (audit.py rides along beside it,
+         which conftest.py needs to ``import audit``).
+      3. Inside the ``pwnguard/`` package directory - the legacy
          embedded layout, where a consumer might have copied PwnGuard's
          tests alongside the implementation files.
-      3. One level above the shim - belt-and-braces fallback that
+      4. One level above the shim - belt-and-braces fallback that
          covers obscure nested checkouts.
 
     Runs pytest as a subprocess so it doesn't entangle the CLI's own
@@ -60,6 +63,7 @@ def _run_self_test() -> int:
     repo_root = os.path.dirname(package_dir)
     candidates = [
         os.path.join(repo_root, "tests"),
+        os.path.join(package_dir, "_bundled", "tests"),
         os.path.join(package_dir, "tests"),
         os.path.join(os.path.dirname(repo_root), "tests"),
     ]

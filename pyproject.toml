@@ -58,3 +58,8 @@ packages = ["pwnguard"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "pwnguard/data/pre-commit" = "pwnguard/data/pre-commit"
+# Bundle the test suite + the audit.py shim so `pwnguard --self-test`
+# works from a pip/pipx install, not just a source checkout. conftest.py
+# adds its parent dir to sys.path, so audit.py must sit beside tests/.
+"tests" = "pwnguard/_bundled/tests"
+"audit.py" = "pwnguard/_bundled/audit.py"
