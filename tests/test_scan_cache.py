@@ -37,6 +37,7 @@ def _result() -> AuditResult:
     ]
     r.files_scanned = 2
     r.elapsed = 1.5
+    r.suppressed = 3
     return r
 
 
@@ -49,6 +50,7 @@ def test_result_dict_round_trip_preserves_fields():
     assert rebuilt.observations == original.observations
     assert rebuilt.files_scanned == 2
     assert rebuilt.elapsed == 1.5
+    assert rebuilt.suppressed == 3
 
 
 # --- store / load ------------------------------------------------------

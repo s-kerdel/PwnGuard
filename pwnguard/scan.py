@@ -39,6 +39,7 @@ from pwnguard.models import AuditResult, Finding, Observation
 from pwnguard.parser import parse_response
 from pwnguard.prompts import EXPLAIN_PROMPT_TEMPLATE, build_system_prompt
 from pwnguard.security import _sanitize
+from pwnguard.suppress import apply_inline_suppressions
 
 
 def _run_scan_chunked(
@@ -209,6 +210,7 @@ def _result_to_dict(result: AuditResult) -> dict:
         "files_scanned": result.files_scanned,
         "error": result.error,
         "elapsed": result.elapsed,
+        "suppressed": result.suppressed,
     }
 
 
@@ -219,6 +221,7 @@ def _result_from_dict(data: dict) -> AuditResult:
         files_scanned=data.get("files_scanned", 0),
         error=data.get("error"),
         elapsed=data.get("elapsed", 0.0),
+        suppressed=data.get("suppressed", 0),
     )
 
 
@@ -490,6 +493,19 @@ def run_scan(
             ui.dim(
                 f"PwnGuard: model returned {n} observation{'s' if n != 1 else ''} "
                 f"(observations field in response: {present})"
+            ),
+            file=sys.stderr,
+        )
+
+    # Inline suppressions: drop findings the developer marked as accepted
+    # false positives with a pwnguard:ignore comment in the diff, before
+    # the gate sees them. Cached after this so a --cached re-run matches.
+    suppressed = apply_inline_suppressions(result, diff_lines)
+    if suppressed:
+        print(
+            ui.dim(
+                f"PwnGuard: {suppressed} finding(s) suppressed inline "
+                f"(pwnguard:ignore)"
             ),
             file=sys.stderr,
         )

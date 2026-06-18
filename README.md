@@ -268,6 +268,42 @@ PWNGUARD_SKIP=1 git commit -m "WIP (intentionally skipping PwnGuard)"
 git commit --no-verify
 ```
 
+### Suppress a false positive (`pwnguard:ignore`)
+
+When a finding is a confirmed false positive, drop it without disabling
+the gate for everything else: add a `pwnguard:ignore` comment in the code
+under review. The marker travels in the same diff as the code it excuses,
+so the reason is visible right next to it and there's no central file to
+maintain. Suppression is scoped to the file the marker is in.
+
+```php
+// pwnguard:ignore CWE-89 - parameterized by the ORM layer
+$rows = $db->raw("SELECT * FROM users WHERE id = $id");
+```
+
+Marker forms (use any comment syntax your language allows):
+
+| Form | Scope | Drops |
+|------|-------|-------|
+| `pwnguard:ignore CWE-89` | whole file | findings whose CWE matches |
+| `pwnguard:ignore "sql injection"` | whole file | findings whose title/description contains the quoted text (case-insensitive) |
+| `pwnguard:ignore` | nearby lines | any finding anchored within ~3 lines of the marker |
+
+Trailing text after the form is a free-text reason and is ignored by the
+matcher. The scan reports how many findings were suppressed
+(`N finding(s) suppressed inline`), and `--json` includes a `suppressed`
+count, so suppression is never silent. List every marker in the repo with
+`git grep pwnguard:ignore`.
+
+The marker is matched wherever its text appears in the scanned diff, so
+avoid writing the literal token in prose or docstrings near code you still
+want reviewed (it would act as a bare, line-scoped suppression there).
+
+A ready-made fixture lives at
+[`demo/suppression_demo.py`](https://github.com/s-kerdel/PwnGuard/blob/main/demo/suppression_demo.py):
+intentionally vulnerable, with three ignore markers (one per form) plus
+unmarked findings that still block, for testing the gate.
+
 ## CLI reference
 
 Every flag accepted by `pwnguard`. Default values come from
@@ -577,6 +613,10 @@ Both block merge on HIGH/CRITICAL findings and post results as MR
 comments. For comment posting, set `GITLAB_TOKEN` (or use the
 auto-provided `CI_JOB_TOKEN` for project-internal access).
 
+For GitHub Actions, a generic example, and how to rehearse the gate
+locally before configuring any pipeline, see
+[docs/ci-cd.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/ci-cd.md).
+
 ## Enforcement
 
 | Layer | Threshold | Bypassable |
@@ -589,7 +629,9 @@ hard gate.
 
 ## Limitations
 
-- AI produces false positives. Review findings before acting.
+- AI produces false positives. Review findings before acting; suppress a
+  confirmed one with a `pwnguard:ignore` comment (see
+  [Suppress a false positive](#suppress-a-false-positive-pwnguardignore)).
 - Cannot see runtime behaviour, only static code.
 - Large diffs may be truncated on non-chunked runs (`max_diff_lines`);
   chunked mode handles this by splitting per file / per hunk.
@@ -625,6 +667,7 @@ In-depth guides live under `docs/`:
 - [Architecture & opaque anchor tokens](https://github.com/s-kerdel/PwnGuard/blob/main/docs/architecture.md) — how the diff is tagged, sent to the model, and resolved back to file/line.
 - [Interactive review TUI](https://github.com/s-kerdel/PwnGuard/blob/main/docs/review-tui.md) — `--review` key bindings and workflow.
 - [Monitor mode (`--monitor`)](https://github.com/s-kerdel/PwnGuard/blob/main/docs/monitor-mode.md) — dashboard for watching remote repos and auditing each new commit as it lands.
+- [CI/CD usage](https://github.com/s-kerdel/PwnGuard/blob/main/docs/ci-cd.md) — gating a pipeline by exit code, GitHub Actions / GitLab / generic examples, rehearsing the gate locally, and suppressing false positives in CI.
 - [Choosing an Ollama model & handling large diffs](https://github.com/s-kerdel/PwnGuard/blob/main/docs/ollama-guide.md) — local-model picks by VRAM tier, plus the chunked-mode trade-off when a diff overflows the context window.
 - [Development & testing](https://github.com/s-kerdel/PwnGuard/blob/main/docs/development.md) — running the pytest suite, the `--self-test` entry point, and the pre-commit auto-run for this repo.
 

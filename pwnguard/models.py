@@ -76,6 +76,8 @@ class AuditResult:
     files_scanned: int = 0
     error: Optional[str] = None
     elapsed: float = 0.0  # seconds spent waiting on the AI backend
+    # Count of findings dropped by inline pwnguard:ignore markers.
+    suppressed: int = 0
 
     @property
     def blocking_findings(self) -> list[Finding]:

@@ -545,6 +545,8 @@ def main():
         # downstream consumers don't see an unexpected empty list.
         if runtime.show_observations:
             output["observations"] = [asdict(o) for o in result.observations]
+        if result.suppressed:
+            output["suppressed"] = result.suppressed
         if result.error:
             output["error"] = result.error
         print(json.dumps(output, indent=2))
