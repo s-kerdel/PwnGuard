@@ -32,6 +32,24 @@ Issues = "https://github.com/s-kerdel/PwnGuard/issues"
 [project.scripts]
 pwnguard = "pwnguard.cli:main"
 
+[tool.ruff]
+target-version = "py39"
+line-length = 88
+
+[tool.ruff.lint]
+# Enable every rule, then opt out of groups that do not fit this project.
+select = ["ALL"]
+ignore = [
+  "D",      # docstrings: codebase is not documented this way
+  "ANN",    # type annotations: codebase is not fully typed
+  "T201",   # print: legitimate output for a CLI tool
+  "COM812", # trailing comma: conflicts with the formatter
+  "ISC001", # implicit string concat: conflicts with the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"] # assert is expected in pytest
+
 [tool.hatch.version]
 path = "pwnguard/__init__.py"
 

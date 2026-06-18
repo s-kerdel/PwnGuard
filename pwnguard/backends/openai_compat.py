@@ -124,8 +124,10 @@ def query_openai_compat(diff: str, config: dict, system_prompt: str = SYSTEM_PRO
     }
     # Same JSON-output toggle as the Ollama backend: when on, ask the
     # server to constrain output to a JSON object. Supported by OpenAI,
-    # LiteLLM, vLLM (with guided_json), and most other proxies.
-    if runtime.ollama_json_mode:
+    # LiteLLM, vLLM (with guided_json), and most other proxies, but not
+    # universal - so openai-compat defaults this off (see cli.main) and
+    # users opt in with --format json on servers that support it.
+    if runtime.json_output_mode:
         payload_dict["response_format"] = {"type": "json_object"}
 
     # Forward optional tunables. num_predict -> max_tokens to match

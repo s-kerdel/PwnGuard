@@ -45,7 +45,9 @@ from pwnguard.security import _is_safe_ref, _sanitize  # noqa: F401
 from pwnguard.fetchers import (  # noqa: F401
     _build_commit_url,
     _format_relative_time,
+    _valid_sha,
     fetch_from_url,
+    list_commit_range_from_url,
     list_commits_from_url,
 )
 
@@ -61,13 +63,25 @@ from pwnguard.monitor import (  # noqa: F401
     _build_monitor_items,
     _deserialize_diff_lines,
     _ensure_repo_entries,
+    _first_commit,
     _load_monitor_state,
+    _make_commit_record,
+    _mark_commit_viewed,
+    _migrate_state_v1_to_v2,
     _monitor_state_path,
+    _new_commit_shas,
     _ordered_monitor_keys,
+    _prune_commits,
+    _record_audited_commit,
+    _render_monitor_commit_row,
+    _render_monitor_row,
+    _repo_all_findings,
     _repo_key,
     _run_monitor_refresh,
+    _sanitize_loaded_state,
     _save_monitor_state,
     _serialize_diff_lines,
+    _sorted_finding_indices,
     _summarise_refresh,
 )
 

@@ -219,13 +219,17 @@ def render_tui_finding_row(
         prefix = f"   {cursor_mark}  {badge}  {title_text}"
         title_w = ui.visible_len(prefix)
         meta_w = ui.visible_len(meta)
-        if meta_w and title_w + META_MIN_GAP + meta_w <= width:
-            pad = width - title_w - meta_w
+        # Budget width-1, never the last column: emit_tui_frame's per-line
+        # \x1b[K erases a glyph in the final column (wrap-pending cursor),
+        # which would clip the last char of the right-aligned meta.
+        usable = max(1, width - 1)
+        if meta_w and title_w + META_MIN_GAP + meta_w <= usable:
+            pad = usable - title_w - meta_w
             print(prefix + (" " * pad) + meta)
         else:
             print(prefix)
             if meta_w:
-                print((" " * max(0, width - meta_w)) + meta)
+                print((" " * max(0, usable - meta_w)) + meta)
         return
 
     # Expanded: reuse the boxed-card helper from the default layout.

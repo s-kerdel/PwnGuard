@@ -53,7 +53,7 @@ def query_ollama(diff: str, config: dict, system_prompt: str = SYSTEM_PROMPT) ->
     # produce valid JSON. Reliable but slow (~2x on 7B). When the user
     # opts out, parse_response's regex-extract + escape-fix fallbacks
     # are what catch any non-JSON preamble / markdown fences.
-    if runtime.ollama_json_mode:
+    if runtime.json_output_mode:
         payload_dict["format"] = "json"
 
     # Forward optional model tunables. Each is opt-in via config so the

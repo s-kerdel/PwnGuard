@@ -304,15 +304,18 @@ def main():
         ),
     )
     advanced_group.add_argument(
-        "--ollama-format",
+        "--format",
+        "--ollama-format",  # deprecated alias; kept so existing scripts work
+        dest="output_format",
         choices=["json", "raw"],
-        default="json",
+        default=None,
         help=(
-            "Ollama output mode. 'json' (default) forces valid JSON via "
-            "Ollama's constrained generation - reliable but ~2x slower "
-            "on 7B models. 'raw' lets the model emit freely; faster but "
-            "leans on PwnGuard's parse fallbacks when the model wraps "
-            "JSON in markdown or adds preamble."
+            "Model output mode. 'json' constrains output to valid JSON "
+            "(Ollama constrained generation; openai-compat "
+            "response_format=json_object): reliable but slower, and not "
+            "supported by every openai-compat server. 'raw' lets the "
+            "model emit freely and relies on PwnGuard's parse fallbacks. "
+            "Default: json for ollama, raw for openai-compat."
         ),
     )
     advanced_group.add_argument(
@@ -437,8 +440,16 @@ def main():
         # `--code-preview off` still works for users who want it off.
         runtime.set_code_preview(True)
 
-    # Ollama JSON mode toggle (only meaningful for the ollama backend).
-    runtime.set_ollama_json_mode(args.ollama_format == "json")
+    # Output-format default is backend-aware. Ollama uses constrained
+    # JSON generation (reliable on small models); openai-compat servers
+    # vary in response_format support, so default to raw there instead of
+    # forcing users to pass --format raw by hand. Claude backends ignore
+    # this toggle (single call, no constrained mode).
+    if args.output_format is not None:
+        json_mode = args.output_format == "json"
+    else:
+        json_mode = backend == "ollama"
+    runtime.set_json_output_mode(json_mode)
 
     # Debug mode replaces the spinner with a live token stream and
     # prints per-request diagnostics. Currently only the ollama backend

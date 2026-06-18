@@ -37,6 +37,13 @@ def _platform_token(*env_names) -> Optional[str]:
     return None
 
 
+def _valid_sha(sha: str) -> bool:
+    """A git SHA is lowercase hex, 4-40 chars. Guards against a tampered
+    state file injecting extra path / query segments through a forged
+    base SHA before we splice it into a compare URL."""
+    return bool(sha) and re.match(r"^[0-9a-f]{4,40}$", sha) is not None
+
+
 def _http_get(url: str, headers: dict) -> bytes:
     """Plain GET with explicit timeout. Centralised so error handling
     stays consistent across the GitLab / GitHub helpers, and so a
@@ -285,6 +292,60 @@ def _list_gitlab_commits(
     return out
 
 
+def _compare_gitlab_commits(
+    parsed: urllib.parse.ParseResult,
+    base_sha: str,
+    branch: str,
+    limit: int,
+) -> tuple:
+    """GitLab compare: commits between ``base_sha`` (exclusive) and
+    ``branch`` HEAD (inclusive), oldest -> newest. Returns
+    ``(status, commits)`` with status ``"identical"`` or ``"ok"``. GitLab
+    exposes no ahead/behind status, so a force-push isn't distinguished
+    here; the caller's dedup + pointer-advance keep that case safe.
+    """
+    head = parsed.path.split("/-/")[0]
+    project_path = head.strip("/")
+    if not project_path or "/" not in project_path:
+        sys.exit(f"Invalid GitLab project URL: {parsed.geturl()!r}")
+
+    token = _platform_token("GITLAB_TOKEN", "PWNGUARD_GITLAB_TOKEN")
+    if not token:
+        sys.exit("GitLab compare requires GITLAB_TOKEN env var (api or read_api).")
+
+    encoded = urllib.parse.quote(project_path, safe="")
+    api_url = (
+        f"{parsed.scheme}://{parsed.netloc}/api/v4/projects/{encoded}/"
+        f"repository/compare"
+        f"?from={urllib.parse.quote(base_sha)}&to={urllib.parse.quote(branch)}"
+    )
+    body = _http_get(api_url, {"PRIVATE-TOKEN": token})
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        sys.exit(f"GitLab returned non-JSON for compare: {e}")
+    if not isinstance(data, dict):
+        sys.exit(f"GitLab compare: expected object, got {type(data).__name__}")
+
+    commits = []
+    for item in data.get("commits") or []:
+        if not isinstance(item, dict) or "id" not in item:
+            continue
+        commits.append((item["id"], item.get("committed_date")))
+    # GitLab's compare ordering isn't documented as stable, so sort
+    # oldest -> newest by committed_date (ISO 8601 sorts chronologically).
+    # Undated commits sort last; the next refresh's dedup catches any
+    # straggler.
+    if commits:
+        commits.sort(key=lambda c: (c[1] is None, c[1] or ""))
+    # Keep the OLDEST `limit` so the caller drains the backlog
+    # contiguously from the oldest end (compare has no per_page knob).
+    if len(commits) > limit:
+        commits = commits[:limit]
+    status = "identical" if not commits else "ok"
+    return status, commits
+
+
 def _list_github_commits(
     parsed: urllib.parse.ParseResult,
     branch: str,
@@ -321,6 +382,56 @@ def _list_github_commits(
         committer = commit.get("committer") or {}
         out.append((item["sha"], committer.get("date")))
     return out
+
+
+def _compare_github_commits(
+    parsed: urllib.parse.ParseResult,
+    base_sha: str,
+    branch: str,
+    limit: int,
+) -> tuple:
+    """GitHub compare: commits between ``base_sha`` (exclusive) and
+    ``branch`` HEAD (inclusive), oldest -> newest.
+
+    Returns ``(status, commits)``. GitHub's own ``status`` field tells
+    us whether the range is a clean fast-forward (``ahead``), empty
+    (``identical``), or a rewrite (``behind`` / ``diverged``) - the last
+    maps to ``"diverged"`` so the caller falls back to auditing HEAD.
+    With ``per_page=limit`` the first page is the oldest ``limit``
+    commits, which is exactly the contiguous chunk the caller drains.
+    """
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) < 2:
+        sys.exit(f"Invalid GitHub URL: {parsed.geturl()!r}")
+    owner, repo = parts[:2]
+
+    api_url = (
+        f"{_github_api_base(parsed)}/repos/{owner}/{repo}/compare/"
+        f"{urllib.parse.quote(base_sha)}...{urllib.parse.quote(branch)}"
+        f"?per_page={int(limit)}"
+    )
+    body = _http_get(api_url, _github_headers("application/vnd.github+json"))
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        sys.exit(f"GitHub returned non-JSON for compare: {e}")
+    if not isinstance(data, dict):
+        sys.exit(f"GitHub compare: expected object, got {type(data).__name__}")
+
+    status = {
+        "ahead": "ok",
+        "identical": "identical",
+        "behind": "diverged",
+        "diverged": "diverged",
+    }.get(data.get("status"), "ok")
+    commits = []
+    for item in data.get("commits") or []:
+        if not isinstance(item, dict) or "sha" not in item:
+            continue
+        commit = item.get("commit") or {}
+        committer = commit.get("committer") or {}
+        commits.append((item["sha"], committer.get("date")))
+    return status, commits
 
 
 def _build_commit_url(repo_url: str, sha: str) -> str:
@@ -363,6 +474,38 @@ def list_commits_from_url(url: str, branch: str, limit: int = 1) -> list:
         return _list_gitlab_commits(parsed, branch, limit)
     if "github" in host:
         return _list_github_commits(parsed, branch, limit)
+    sys.exit(
+        f"Cannot determine platform from URL: {url!r}\n"
+        f"Hostname must contain 'gitlab' or 'github'. Custom-domain "
+        f"self-hosted instances are not yet supported in monitor mode."
+    )
+
+
+def list_commit_range_from_url(
+    url: str,
+    branch: str,
+    base_sha: str,
+    limit: int = 100,
+) -> tuple:
+    """Commits between ``base_sha`` (exclusive) and ``branch`` HEAD
+    (inclusive), oldest -> newest, via the platform compare endpoint.
+
+    Returns ``(status, commits)`` where status is ``"ok"`` (clean forward
+    range), ``"identical"`` (nothing new), or ``"diverged"`` (base_sha no
+    longer an ancestor of HEAD: force-push / rebase, caller should audit
+    HEAD only). ``commits`` is ``(sha, date_or_None)`` tuples, capped to
+    the oldest ``limit``. ``base_sha`` must be a validated hex SHA.
+    """
+    if not _valid_sha(base_sha):
+        sys.exit(f"Invalid base commit SHA: {base_sha!r}")
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        sys.exit(f"Invalid URL: {url!r} (expected http(s)://...)")
+    host = parsed.netloc.lower()
+    if "gitlab" in host:
+        return _compare_gitlab_commits(parsed, base_sha, branch, limit)
+    if "github" in host:
+        return _compare_github_commits(parsed, base_sha, branch, limit)
     sys.exit(
         f"Cannot determine platform from URL: {url!r}\n"
         f"Hostname must contain 'gitlab' or 'github'. Custom-domain "

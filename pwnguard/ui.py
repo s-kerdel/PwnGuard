@@ -187,6 +187,10 @@ def cyan(text: str) -> str:
     return _wrap(text, C.CYAN)
 
 
+def yellow(text: str) -> str:
+    return _wrap(text, C.YELLOW)
+
+
 def blue(text: str) -> str:
     return _wrap(text, C.BLUE)
 

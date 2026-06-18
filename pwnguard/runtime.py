@@ -14,11 +14,12 @@ the toggle at startup).
 # Resolved in cli.main() based on --code-preview.
 show_code_preview = True
 
-# Whether to request Ollama's structured JSON output mode. On gives
-# valid JSON guaranteed but roughly doubles generation time on 7B
-# models because the constraint engine has to validate every token.
-# Off is faster but relies on the model staying in schema voluntarily.
-ollama_json_mode = True
+# Whether to request the backend's structured JSON output mode (Ollama
+# `format: json`; openai-compat `response_format: json_object`). On gives
+# valid JSON but is slower and not supported by every openai-compat
+# server. Off is faster and relies on the model staying in schema plus
+# PwnGuard's parse fallbacks. Resolved per-backend in cli.main().
+json_output_mode = True
 
 # Debug mode: when enabled, the Ollama and openai-compat backends use
 # streaming so the model's output appears on stderr as it's generated.
@@ -42,11 +43,12 @@ def set_code_preview(enabled: bool) -> None:
     show_code_preview = enabled
 
 
-def set_ollama_json_mode(enabled: bool) -> None:
-    """Toggle Ollama's constrained-JSON output mode. cli.main() resolves
-    the flag once before any backend dispatch."""
-    global ollama_json_mode
-    ollama_json_mode = enabled
+def set_json_output_mode(enabled: bool) -> None:
+    """Toggle the backend's constrained-JSON output mode. cli.main()
+    resolves the flag (and its backend-aware default) once before any
+    backend dispatch."""
+    global json_output_mode
+    json_output_mode = enabled
 
 
 def set_debug_mode(enabled: bool) -> None:

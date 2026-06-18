@@ -4,7 +4,7 @@ The state file (``.pwnguard-monitor.json`` in the cwd by default)
 caches each watched repo's last-audited SHA and the resolved
 findings, so reopening the TUI doesn't re-query the LLM for commits
 already seen. ``last_viewed_sha`` is the user's acknowledgement;
-when it lags ``last_audited_sha``, the row renders an ``[updated]``
+commits newer than it render a ``●`` dot and feed the row's ``N new``
 chip.
 """
 
@@ -34,12 +34,13 @@ from pwnguard.fetchers import (
     _build_commit_url,
     _format_relative_time,
     fetch_from_url,
+    list_commit_range_from_url,
     list_commits_from_url,
 )
 from pwnguard.models import AuditResult, Finding
 from pwnguard.parser import parse_response
 from pwnguard.prompts import build_system_prompt
-from pwnguard.render import SEVERITY_LETTER, _print_legend
+from pwnguard.render import SEVERITY_LETTER, _print_legend, _truncate_visible
 from pwnguard.report import (
     _default_findings_export_path,
     export_monitor_findings_markdown,
@@ -95,14 +96,61 @@ def _load_monitor_state(path: str) -> dict:
         return skeleton
     if not isinstance(data, dict) or "repos" not in data:
         return skeleton
+    # Upgrade an older flat-findings file to the per-commit shape before
+    # anything downstream touches it.
+    data = _migrate_state_v1_to_v2(data)
     # Belt-and-braces sanitisation: model output was sanitized at parse
     # time, but the file could have been tampered with offline. Re-run
     # the same scrub on every string we hand to the renderer.
     return _sanitize_loaded_state(data)
 
 
+def _migrate_state_v1_to_v2(state: dict) -> dict:
+    """In-place upgrade of a v1 monitor cache to the v2 shape.
+
+    v1 stored a single flat ``findings`` list + ``diff_lines`` per repo,
+    keyed implicitly off ``last_audited_sha``. v2 nests them under a
+    SHA-keyed ``commits`` map so the dashboard can show every audited
+    commit, not just the latest. An already-audited repo becomes a
+    single-commit cache; a placeholder (never audited) just gains empty
+    ``commits`` / ``order``. Idempotent - entries already carrying
+    ``commits`` are left untouched, so re-loading a v2 file is a no-op.
+    """
+    repos = state.get("repos")
+    if not isinstance(repos, dict):
+        return state
+    for entry in repos.values():
+        if not isinstance(entry, dict) or "commits" in entry:
+            continue
+        sha = entry.get("last_audited_sha")
+        old_findings = entry.pop("findings", None) or []
+        old_diff = entry.pop("diff_lines", None) or {}
+        old_date = entry.pop("last_audited_commit_date", None)
+        commits: dict = {}
+        order: list = []
+        if sha:
+            commits[sha] = {
+                "sha": sha,
+                "date": old_date,
+                "audited_at": entry.get("audited_at"),
+                "findings": old_findings,
+                "diff_lines": old_diff,
+            }
+            order = [sha]
+        entry["commits"] = commits
+        entry["order"] = order
+        entry["head_sha"] = sha
+    state["version"] = MONITOR_STATE_VERSION
+    return state
+
+
 def _sanitize_loaded_state(state: dict) -> dict:
-    """Re-sanitise every model-supplied string in a freshly loaded state."""
+    """Re-sanitise every model-supplied string in a freshly loaded state.
+
+    Walks the per-commit cache: each ``commits[sha]`` record carries its
+    own findings + diff_lines, both of which could have been tampered
+    with offline.
+    """
     repos = state.get("repos", {})
     if not isinstance(repos, dict):
         state["repos"] = {}
@@ -110,27 +158,43 @@ def _sanitize_loaded_state(state: dict) -> dict:
     for entry in repos.values():
         if not isinstance(entry, dict):
             continue
-        findings = entry.get("findings") or []
-        for f in findings:
-            if not isinstance(f, dict):
+        # The repo header renders these SHAs raw via _format_short_sha,
+        # so scrub them too - a tampered file could smuggle an ANSI
+        # escape through a forged pointer.
+        for sha_field in ("last_audited_sha", "last_viewed_sha", "head_sha"):
+            v = entry.get(sha_field)
+            if isinstance(v, str):
+                entry[sha_field] = _sanitize(v)
+        commits = entry.get("commits")
+        if not isinstance(commits, dict):
+            continue
+        for rec in commits.values():
+            if not isinstance(rec, dict):
                 continue
-            for k in ("title", "file", "description", "recommendation",
-                      "cwe", "fix_example", "hunk_context", "anchor"):
-                v = f.get(k)
-                if isinstance(v, str):
-                    f[k] = _sanitize(v)
-        # Cached diff content is straight from the upstream platform,
-        # not from the model - so it's already "untrusted user data"
-        # by the same logic as a live --review run. Scrub it the same
-        # way before it reaches the renderer.
-        cached_diff = entry.get("diff_lines")
-        if isinstance(cached_diff, dict):
-            for lines in cached_diff.values():
-                if not isinstance(lines, dict):
+            # The commit row renders rec["sha"] raw (short form), so it
+            # gets the same scrub as the model-supplied finding fields.
+            if isinstance(rec.get("sha"), str):
+                rec["sha"] = _sanitize(rec["sha"])
+            for f in rec.get("findings") or []:
+                if not isinstance(f, dict):
                     continue
-                for ln_key, content in list(lines.items()):
-                    if isinstance(content, str):
-                        lines[ln_key] = _sanitize(content)
+                for k in ("title", "file", "description", "recommendation",
+                          "cwe", "fix_example", "hunk_context", "anchor"):
+                    v = f.get(k)
+                    if isinstance(v, str):
+                        f[k] = _sanitize(v)
+            # Cached diff content is straight from the upstream platform,
+            # not from the model - so it's already "untrusted user data"
+            # by the same logic as a live --review run. Scrub it the same
+            # way before it reaches the renderer.
+            cached_diff = rec.get("diff_lines")
+            if isinstance(cached_diff, dict):
+                for lines in cached_diff.values():
+                    if not isinstance(lines, dict):
+                        continue
+                    for ln_key, content in list(lines.items()):
+                        if isinstance(content, str):
+                            lines[ln_key] = _sanitize(content)
     return state
 
 
@@ -207,6 +271,38 @@ def _deserialize_diff_lines(serialized: dict) -> dict:
     return out
 
 
+def _make_commit_record(
+    sha: str,
+    date: Optional[str],
+    result: AuditResult,
+    diff_lines: dict,
+) -> dict:
+    """Assemble the per-commit cache record stored under ``commits[sha]``.
+
+    Findings are serialised with ``asdict`` and diff lines through
+    ``_serialize_diff_lines`` so the whole record is JSON-safe.
+    """
+    return {
+        "sha": sha,
+        "date": date,
+        "audited_at": datetime.now(timezone.utc).isoformat(),
+        "findings": [asdict(f) for f in result.findings],
+        "diff_lines": _serialize_diff_lines(diff_lines),
+    }
+
+
+def _repo_all_findings(entry: dict) -> list:
+    """Flatten findings across all of a repo's cached commits, newest
+    commit first. Backs the repo-row severity breakdown so a repo's
+    header reflects every audited commit, not just the latest."""
+    out: list = []
+    commits = entry.get("commits") or {}
+    for sha in entry.get("order") or []:
+        rec = commits.get(sha) or {}
+        out.extend(rec.get("findings") or [])
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Refresh cycle
 # ---------------------------------------------------------------------------
@@ -235,6 +331,10 @@ def _audit_commit_for_monitor(
     prompt overflowed; the user would have no signal that the model
     in fact found something the host couldn't keep.
     """
+    # TODO(normalize): the overflow check + dispatch/parse/resolve below
+    # duplicate run_scan() (scan.py). Extract shared should_chunk() +
+    # audit_single_diff() helpers - deferred, see
+    # memory/project_monitor_audit_core_refactor.md.
     commit_url = _build_commit_url(repo_url, sha)
     raw_diff = fetch_from_url(commit_url)
     filtered = filter_diff(raw_diff, config, apply_truncation=False)
@@ -316,39 +416,100 @@ def _audit_commit_for_monitor(
     return result, diff_lines
 
 
+# Upper bound on commits pulled per repo per refresh, independent of
+# the per-refresh audit cap. Bounds the compare-API response so a repo
+# thousands of commits ahead can't blow up memory; the audit cap then
+# slices the oldest chunk out of this window.
+_RANGE_FETCH_CEILING = 100
+
+
+def _first_commit(commits: list) -> Optional[tuple]:
+    """Normalise the head of a ``list_commits_from_url`` result to a
+    ``(sha, date_or_None)`` tuple, tolerating the legacy bare-SHA shape.
+    Returns None for an empty list."""
+    if not commits:
+        return None
+    first = commits[0]
+    if isinstance(first, tuple) and len(first) == 2:
+        return first
+    return (first, None)
+
+
+def _record_audited_commit(
+    entry: dict,
+    sha: str,
+    date: Optional[str],
+    result: AuditResult,
+    diff_lines: dict,
+) -> None:
+    """Store one audited commit in the repo entry and advance the
+    pointer. ``order`` stays newest-first; calling this in oldest ->
+    newest order leaves the newest commit at the front."""
+    rec = _make_commit_record(sha, date, result, diff_lines)
+    entry.setdefault("commits", {})[sha] = rec
+    order = entry.setdefault("order", [])
+    if sha in order:
+        order.remove(sha)
+    order.insert(0, sha)
+    entry["last_audited_sha"] = sha
+    entry["audited_at"] = rec["audited_at"]
+
+
+def _prune_commits(entry: dict, keep: int) -> None:
+    """Drop the oldest cached commits beyond ``keep`` to bound state-file
+    growth. ``order`` is newest-first, so the tail is the oldest."""
+    order = entry.get("order") or []
+    if keep < 1 or len(order) <= keep:
+        return
+    drop = order[keep:]
+    entry["order"] = order[:keep]
+    commits = entry.get("commits") or {}
+    for s in drop:
+        commits.pop(s, None)
+
+
 def _run_monitor_refresh(
     config: dict,
     state: dict,
     backend: str,
     progress=None,
 ) -> dict:
-    """Iterate the configured monitor repos, audit any new commit.
+    """Iterate the configured monitor repos, audit every new commit
+    between each repo's ``last_audited_sha`` and HEAD.
 
-    First-encounter strategy is "C — reset baseline to HEAD": when a
-    repo has no ``last_audited_sha`` we record the current HEAD and
-    skip the audit. Only commits that land **after** the first
-    refresh produce findings.
+    First encounter audits HEAD only (so the user sees current state
+    immediately). Afterwards the compare endpoint yields the commits
+    that landed since ``last_audited_sha``; we dedup by SHA and audit
+    them oldest -> newest so the pointer advances contiguously. With
+    ``review_everything_at_once`` on (default) one refresh keeps
+    draining windows until the branch is fully caught up; with it off
+    we audit a single ``max_commits_per_refresh`` batch and surface the
+    rest as backlog for the next [r] press.
 
-    ``progress`` is an optional callback ``(idx, total, name, msg)`` so
-    the TUI can update its status bar while we work. Returns a dict
-    keyed by repo state-key mapping to one of:
-      - ``"first-seen"`` — baseline recorded, no audit run.
-      - ``"unchanged"`` — head matches last_audited_sha, nothing to do.
-      - ``"audited"``   — new commit audited, state updated.
-      - ``"error: ..."`` — recoverable failure (one repo failing must
-        not abort the whole refresh).
+    ``progress`` is an optional callback ``(idx, total, name, msg)``.
+    Returns a dict keyed by repo state-key mapping to a status dict
+    ``{"status", "audited", "backlog", "error"}`` where ``status`` is
+    one of ``first-seen`` / ``unchanged`` / ``audited`` / ``diverged``
+    (force-push fallback) / ``error``. One repo failing never aborts
+    the whole refresh.
     """
     monitor_cfg = config.get("monitor", {}) or {}
     repos = monitor_cfg.get("repos", []) or []
+    cap = max(1, int(monitor_cfg.get("max_commits_per_refresh", 10) or 10))
+    keep = max(1, int(monitor_cfg.get("keep_commits", 30) or 30))
+    ceiling = max(cap, _RANGE_FETCH_CEILING)
     summary: dict = {}
     state.setdefault("repos", {})
+
+    def _err(msg, backlog=0):
+        return {"status": "error", "error": msg, "audited": 0, "backlog": backlog}
 
     for idx, repo_cfg in enumerate(repos):
         name = repo_cfg.get("name") or repo_cfg.get("url", "?")
         url = repo_cfg.get("url")
         branch = repo_cfg.get("branch")
         if not url or not branch:
-            summary[name] = "error: monitor entry missing 'url' or 'branch'"
+            summary[name] = _err("monitor entry missing 'url' or 'branch'")
             continue
 
         key = _repo_key(url, branch)
@@ -358,96 +519,247 @@ def _run_monitor_refresh(
             "branch": branch,
             "last_audited_sha": None,
             "last_viewed_sha": None,
-            "last_audited_commit_date": None,
+            "head_sha": None,
             "audited_at": None,
-            "findings": [],
+            "commits": {},
+            "order": [],
         }
         # Keep the name in sync with the latest config (the user may
         # have renamed an entry between runs).
         entry["name"] = name
         entry["url"] = url
         entry["branch"] = branch
+        entry.setdefault("commits", {})
+        entry.setdefault("order", [])
+        # Reset per-refresh status each cycle; only the paths below set
+        # them. last_error is cleared here so a repo that recovers stops
+        # showing the stale error chip.
+        entry["pending_count"] = 0
+        entry["last_error"] = None
         state["repos"][key] = entry
 
+        # Stamp an error on the entry (so the row can show it) as well as
+        # the ephemeral summary (so the status line can count it).
+        def _fail(msg, backlog=0, _entry=entry, _key=key):
+            _entry["last_error"] = msg
+            summary[_key] = _err(msg, backlog)
+
+        base = entry.get("last_audited_sha")
+
+        # ---- First encounter: audit HEAD only, set the baseline. ----
+        if base is None:
+            if progress:
+                progress(idx + 1, len(repos), name, "fetching commits...")
+            try:
+                head = _first_commit(list_commits_from_url(url, branch, limit=1))
+            except SystemExit as e:
+                _fail(str(e.code))
+                continue
+            if head is None:
+                _fail("no commits returned for branch")
+                continue
+            head_sha, head_date = head
+            if progress:
+                progress(idx + 1, len(repos), name, f"first audit {head_sha[:7]}...")
+            try:
+                result, diff_lines = _audit_commit_for_monitor(
+                    url, head_sha, config, backend,
+                )
+            except SystemExit as e:
+                _fail(str(e.code))
+                continue
+            _record_audited_commit(entry, head_sha, head_date, result, diff_lines)
+            entry["head_sha"] = head_sha
+            # First encounter is "you're looking at it now" - viewed =
+            # audited so the [updated] chip stays quiet until the NEXT
+            # commit lands.
+            entry["last_viewed_sha"] = head_sha
+            _prune_commits(entry, keep)
+            summary[key] = {"status": "first-seen", "audited": 1, "backlog": 0}
+            continue
+
+        # ---- Subsequent: walk the commit range base..HEAD. ----
         if progress:
-            progress(idx + 1, len(repos), name, "fetching commits...")
-
+            progress(idx + 1, len(repos), name, "fetching commit range...")
         try:
-            commits = list_commits_from_url(url, branch, limit=1)
-        except SystemExit as e:
-            summary[key] = f"error: {e.code}"
-            continue
-        if not commits:
-            summary[key] = "error: no commits returned for branch"
-            continue
-
-        # list_commits_from_url returns (sha, committed_date_iso) tuples.
-        # The date is informational - render-only - so we tolerate it
-        # being None on backward-compat-flavoured servers that don't
-        # ship it.
-        first = commits[0]
-        if isinstance(first, tuple) and len(first) == 2:
-            latest_sha, latest_commit_date = first
-        else:
-            # Defensive: pre-v0.2.0 internal callers used to return bare
-            # SHAs. Keep working if anyone wires this up differently.
-            latest_sha, latest_commit_date = first, None
-
-        is_first_encounter = entry["last_audited_sha"] is None
-        if not is_first_encounter and entry["last_audited_sha"] == latest_sha:
-            summary[key] = "unchanged"
-            continue
-
-        # First encounter OR new commit -> audit the head. The first
-        # encounter case used to skip the audit and just record HEAD
-        # as a "baseline," but that left the dashboard showing
-        # "clean" for unaudited rows. Now the head always gets one
-        # LLM call when a repo is first seen, so the user gets
-        # current-state findings immediately on the first [r] press.
-        if progress:
-            label = "first audit" if is_first_encounter else "auditing"
-            progress(
-                idx + 1, len(repos), name,
-                f"{label} {latest_sha[:7]}...",
-            )
-        try:
-            result, diff_lines = _audit_commit_for_monitor(
-                url, latest_sha, config, backend,
+            status, range_commits = list_commit_range_from_url(
+                url, branch, base, limit=ceiling,
             )
         except SystemExit as e:
-            summary[key] = f"error: {e.code}"
+            _fail(str(e.code))
             continue
 
-        entry["last_audited_sha"] = latest_sha
-        entry["last_audited_commit_date"] = latest_commit_date
-        entry["audited_at"] = datetime.now(timezone.utc).isoformat()
-        entry["findings"] = [asdict(f) for f in result.findings]
-        entry["diff_lines"] = _serialize_diff_lines(diff_lines)
-        # First encounter is "you're looking at it now" - don't fire
-        # the [updated] chip until the NEXT commit lands. Subsequent
-        # audits leave last_viewed_sha alone so the chip surfaces
-        # background changes the user hasn't acknowledged yet.
-        if is_first_encounter:
-            entry["last_viewed_sha"] = latest_sha
-        summary[key] = "audited"
+        if status == "identical":
+            entry["head_sha"] = base
+            summary[key] = {"status": "unchanged", "audited": 0, "backlog": 0}
+            continue
+
+        if status == "diverged":
+            # Force-push / rebase orphaned base_sha. The range isn't a
+            # clean forward set, so fall back to auditing HEAD only.
+            try:
+                head = _first_commit(list_commits_from_url(url, branch, limit=1))
+            except SystemExit as e:
+                _fail(str(e.code))
+                continue
+            if head is None:
+                _fail("no commits returned for branch")
+                continue
+            head_sha, head_date = head
+            entry["head_sha"] = head_sha
+            if head_sha in (entry.get("commits") or {}):
+                # Already audited this SHA under its old reachability.
+                entry["last_audited_sha"] = head_sha
+                summary[key] = {"status": "unchanged", "audited": 0, "backlog": 0}
+                continue
+            if progress:
+                progress(idx + 1, len(repos), name,
+                         f"auditing {head_sha[:7]} (history rewritten)...")
+            try:
+                result, diff_lines = _audit_commit_for_monitor(
+                    url, head_sha, config, backend,
+                )
+            except SystemExit as e:
+                _fail(str(e.code))
+                continue
+            _record_audited_commit(entry, head_sha, head_date, result, diff_lines)
+            _prune_commits(entry, keep)
+            summary[key] = {"status": "diverged", "audited": 1, "backlog": 0}
+            continue
+
+        # ---- status == "ok": forward range, oldest -> newest. ----
+        # With review_everything_at_once on, loop until caught up to HEAD
+        # (cap is just the progress batch size); off audits one capped
+        # batch and reports the rest as backlog.
+        catch_up = bool(monitor_cfg.get("review_everything_at_once", True))
+        total_audited = 0
+        err = None
+        # Carried out of the loop to size the backlog chip from the last
+        # window we touched.
+        window_fresh = 0
+        window_audited = 0
+        while True:
+            if range_commits:
+                newest_in_window = range_commits[-1][0]
+                if len(range_commits) >= ceiling:
+                    # The window may be truncated at the ceiling, so its
+                    # last element isn't necessarily the branch HEAD.
+                    # Resolve the real HEAD (one cheap call) so the
+                    # "+N more" backlog chip doesn't understate how far
+                    # behind we are. Fall back to the window's newest if
+                    # that lookup fails.
+                    try:
+                        head = _first_commit(
+                            list_commits_from_url(url, branch, limit=1),
+                        )
+                    except SystemExit:
+                        head = None
+                    entry["head_sha"] = head[0] if head else newest_in_window
+                else:
+                    entry["head_sha"] = newest_in_window
+            cached = entry.get("commits") or {}
+            fresh = [(s, d) for (s, d) in range_commits if s not in cached]
+            if not fresh:
+                break
+
+            to_audit = fresh if catch_up else fresh[:cap]
+            window_fresh = len(fresh)
+            window_audited = 0
+            for j, (sha, date) in enumerate(to_audit):
+                if progress:
+                    progress(idx + 1, len(repos), name,
+                             f"auditing {sha[:7]} ({total_audited + j + 1} new)...")
+                try:
+                    result, diff_lines = _audit_commit_for_monitor(
+                        url, sha, config, backend,
+                    )
+                except SystemExit as e:
+                    # Stop here so last_audited_sha stays contiguous -
+                    # skipping a failed commit would leave a permanent
+                    # gap in the audited history.
+                    err = str(e.code)
+                    break
+                _record_audited_commit(entry, sha, date, result, diff_lines)
+                window_audited += 1
+                total_audited += 1
+            _prune_commits(entry, keep)
+            if err or not catch_up:
+                break
+            # Window smaller than the ceiling means it reached HEAD -
+            # nothing left to fetch.
+            if len(range_commits) < ceiling:
+                break
+            # More commits beyond this window: re-compare from the
+            # advanced pointer and keep draining.
+            base = entry["last_audited_sha"]
+            try:
+                status, range_commits = list_commit_range_from_url(
+                    url, branch, base, limit=ceiling,
+                )
+            except SystemExit as e:
+                err = str(e.code)
+                break
+            # "identical" = caught up; a mid-drain "diverged" (force-push
+            # landed while we were auditing) stops here and the next
+            # refresh's diverged fallback handles it.
+            if status != "ok":
+                break
+
+        # What we didn't reach in the last window (over the cap, or after
+        # an aborted batch) is surfaced as backlog; a clean catch-up -> 0.
+        remaining = window_fresh - window_audited
+        entry["pending_count"] = remaining
+
+        if total_audited == 0:
+            if err:
+                _fail(err, remaining)
+            else:
+                # Range non-empty but every commit already cached (dedup),
+                # e.g. an overlapping GitLab range: caught up, not an error.
+                summary[key] = {
+                    "status": "unchanged", "audited": 0, "backlog": remaining,
+                }
+            continue
+        summary[key] = {
+            "status": "audited",
+            "audited": total_audited,
+            "backlog": remaining,
+            "error": err,
+        }
 
     return summary
 
 
 def _summarise_refresh(summary: dict) -> str:
-    """Format a one-line summary of a refresh cycle for the status bar."""
-    audited = sum(1 for v in summary.values() if v == "audited")
-    unchanged = sum(1 for v in summary.values() if v == "unchanged")
+    """One-line refresh summary for the status bar, counting commits
+    (not repos) so a multi-commit drain reads honestly, and surfacing
+    any backlog the per-refresh cap deferred."""
+    def _stat(v):
+        return v if isinstance(v, dict) else {}
+    audited_commits = sum(_stat(v).get("audited", 0) for v in summary.values())
+    unchanged = sum(1 for v in summary.values()
+                    if _stat(v).get("status") == "unchanged")
     errors = sum(1 for v in summary.values()
-                 if isinstance(v, str) and v.startswith("error"))
+                 if _stat(v).get("status") == "error")
+    backlog = sum(_stat(v).get("backlog", 0) for v in summary.values())
+
     parts = []
-    if audited:
-        parts.append(f"{audited} audited")
+    if audited_commits:
+        parts.append(
+            f"{audited_commits} commit{'s' if audited_commits != 1 else ''} audited"
+        )
     if unchanged:
         parts.append(f"{unchanged} unchanged")
     if errors:
         parts.append(f"{errors} error{'s' if errors != 1 else ''}")
-    return "refresh: " + ", ".join(parts) if parts else "refresh: nothing to do"
+    line = "refresh: " + ", ".join(parts) if parts else "refresh: nothing to do"
+    if errors:
+        # The per-repo "error" chip + the message under an expanded repo
+        # carry the detail; point the user there instead of dead-ending.
+        line += "  (expand a repo marked 'error' to see why)"
+    if backlog:
+        line += f"  ({backlog} pending — press [r] again)"
+    return line
 
 
 # ---------------------------------------------------------------------------
@@ -489,12 +801,44 @@ def _severity_breakdown(findings: list) -> str:
     return "  " + "  ·  ".join(parts) if parts else ""
 
 
+def _new_commit_shas(entry: dict) -> set:
+    """SHAs of audited commits newer than ``last_viewed_sha`` (the user's
+    acknowledgement point). ``order`` is newest-first; a viewed pointer
+    that is None or pruned means everything cached counts as new."""
+    order = entry.get("order") or []
+    if not order:
+        return set()
+    viewed = entry.get("last_viewed_sha")
+    if viewed is None or viewed not in order:
+        return set(order)
+    return set(order[: order.index(viewed)])
+
+
+def _mark_commit_viewed(entry: dict, target_sha: str) -> bool:
+    """Advance ``last_viewed_sha`` to ``target_sha`` as a forward
+    high-water mark (clears its ``●`` dot and all older ones, leaving
+    newer commits marked new). ``order`` is newest-first. Only moves the
+    pointer forward, so marking an older commit is a no-op. Returns True
+    if it moved."""
+    order = entry.get("order") or []
+    if target_sha not in order:
+        return False
+    viewed = entry.get("last_viewed_sha")
+    cur_idx = order.index(viewed) if viewed in order else len(order)
+    if order.index(target_sha) < cur_idx:
+        entry["last_viewed_sha"] = target_sha
+        return True
+    return False
+
+
 def _render_monitor_row(
     entry: dict,
     *,
     is_expanded: bool,
     is_current: bool,
     width: int,
+    show_all: bool = False,
+    new_shas: Optional[set] = None,
 ) -> None:
     """Print one repo header row. Findings, if any, are rendered as
     separate items beneath (see _render_monitor_finding_row); this
@@ -503,11 +847,17 @@ def _render_monitor_row(
     """
     name = entry.get("name") or entry.get("url") or "?"
     sha = entry.get("last_audited_sha")
-    last_viewed = entry.get("last_viewed_sha")
-    commit_date = entry.get("last_audited_commit_date")
-    findings = entry.get("findings") or []
+    order = entry.get("order") or []
+    commits = entry.get("commits") or {}
+    findings = _repo_all_findings(entry)
     audited = sha is not None
-    updated = audited and (sha != last_viewed)
+    if new_shas is None:
+        new_shas = _new_commit_shas(entry)
+    new_count = len(new_shas)
+    # Commits seen on the branch but not yet audited (single-batch
+    # deferral, or a refresh that errored before draining them).
+    pending = int(entry.get("pending_count") or 0)
+    error = entry.get("last_error")
 
     cursor_mark = ui.bold(ui.cyan("❯")) if is_current else " "
     arrow = "▼" if is_expanded else "▶"
@@ -515,38 +865,102 @@ def _render_monitor_row(
     if not audited:
         count_text = ui.dim("  awaiting first refresh")
     elif findings:
-        # Severity breakdown, e.g. "1 C  ·  3 H  ·  12 INFO". Replaces
-        # the previous flat "N findings" count so the user can see at
-        # a glance which repo needs attention without expanding it.
+        # Severity breakdown aggregated across every audited commit,
+        # e.g. "1 C  ·  3 H  ·  12 INFO", inline after the name.
         count_text = _severity_breakdown(findings)
     else:
         count_text = ui.dim("  clean")
     left = f" {cursor_mark} {arrow}  {name_styled}{count_text}"
 
+    # Right side: relative age, short SHA, then one colour-coded status
+    # chip per concern.
+    newest_rec = commits.get(order[0]) if order else None
+    commit_date = newest_rec.get("date") if newest_rec else None
     short = _format_short_sha(sha)
     relative = _format_relative_time(commit_date)
-    chip = ui.dim("[updated]") if updated else ""
     right_parts = []
     if relative:
         right_parts.append(ui.dim(relative))
-    right_parts.append(ui.dim(short))
-    if chip:
-        right_parts.append(chip)
+    if audited:
+        right_parts.append(ui.dim(short))
+    if new_count:
+        right_parts.append(ui.cyan(f"{new_count} new"))
+    # Only for genuine unaudited backlog. An errored repo shows the error
+    # chip instead (its "pending" is just a symptom of the failure).
+    if pending and not error:
+        right_parts.append(ui.yellow(f"{pending} pending"))
+    if error:
+        right_parts.append(ui.red("error"))
     right = "  ".join(right_parts)
 
-    pad = max(2, width - ui.visible_len(left) - ui.visible_len(right))
+    # Reserve the right side and truncate the name if needed. Budget
+    # width-1, never the last column: emit_tui_frame's per-line \x1b[K
+    # would clip a glyph left in the final column.
+    usable = max(1, width - 1)
+    right_w = ui.visible_len(right)
+    max_left = max(1, usable - right_w - 2)
+    if ui.visible_len(left) > max_left:
+        left = _truncate_visible(left, max_left)
+    pad = max(2, usable - ui.visible_len(left) - right_w)
     print(left + (" " * pad) + right)
 
-    # If expanded but no findings, the dashboard's items list won't
-    # have any finding rows to render under this header; print a hint
-    # in that case so the user understands why expansion looks empty.
-    if is_expanded and not findings:
-        if not audited:
+    if not is_expanded:
+        return
+    # The error message itself is only reachable by expanding the repo,
+    # so the dashboard can answer "why did this error?" without a log.
+    if error:
+        msg = " ".join(str(error).split())
+        print(ui.red("        error: ") + ui.dim(
+            _truncate_visible(msg, max(10, width - 16)),
+        ))
+    if not order:
+        if not error:
+            print(ui.dim("        not yet audited — press [r] to refresh"))
+        return
+    # Findings-first mode hides clean commits; name how many so the count
+    # isn't silent (new-ness is already shown by the ● dots and the chip).
+    if not show_all:
+        clean = [s for s in order if not (commits.get(s) or {}).get("findings")]
+        if clean:
             print(ui.dim(
-                "        not yet audited — press [r] to refresh"
+                f"        {len(clean)} clean hidden  "
+                f"(press [f] to show all commits)"
             ))
-        else:
-            print(ui.dim("        no findings on this commit"))
+
+
+def _render_monitor_commit_row(
+    rec: dict,
+    *,
+    is_expanded: bool,
+    is_current: bool,
+    width: int,
+    is_new: bool = False,
+) -> None:
+    """Print one commit row: short SHA, its own severity breakdown, and
+    relative age. A ``●`` marks a commit newer than the repo's last-viewed
+    point. Findings render as separate rows when the commit is expanded."""
+    sha = rec.get("sha")
+    findings = rec.get("findings") or []
+
+    cursor_mark = ui.bold(ui.cyan("❯")) if is_current else " "
+    arrow = "▼" if is_expanded else "▶"
+    # New/unreviewed dot sits between the arrow and the SHA so the eye
+    # can scan the column for what's landed since the last [v].
+    new_dot = ui.cyan("●") if is_new else " "
+    short = _format_short_sha(sha)
+    short_styled = ui.bold(short) if is_current else ui.cyan(short)
+    count_text = _severity_breakdown(findings) if findings else ui.dim("  clean")
+    left = f"     {cursor_mark} {arrow} {new_dot} {short_styled}{count_text}"
+
+    relative = _format_relative_time(rec.get("date"))
+    right = ui.dim(relative) if relative else ""
+    # Budget width-1 (never the last column) - see _render_monitor_row.
+    usable = max(1, width - 1)
+    pad = max(2, usable - ui.visible_len(left) - ui.visible_len(right))
+    print(left + (" " * pad) + right)
+
+    if is_expanded and not findings:
+        print(ui.dim("            no findings on this commit"))
 
 
 def _render_monitor_finding_row(
@@ -573,41 +987,65 @@ def _render_monitor_finding_row(
     )
 
 
+def _sorted_finding_indices(findings: list) -> list:
+    """Indices of ``findings`` ordered by severity (CRITICAL -> ... ->
+    INFO) with a stable secondary order by emission index. Matches
+    --review so a HIGH SQL-injection finding never sits buried under a
+    pile of INFO rows."""
+    return sorted(
+        range(len(findings)),
+        key=lambda i: (
+            -SEVERITY_ORDER.get(
+                (findings[i].get("severity") or "INFO").upper(), 0,
+            ),
+            i,
+        ),
+    )
+
+
 def _build_monitor_items(
     state: dict,
     keys: list,
     repo_expanded: dict,
+    commit_expanded: Optional[dict] = None,
+    repo_show_all: Optional[dict] = None,
 ) -> list:
     """Flatten the dashboard into an item list the cursor can index.
 
-    Each item is ``(kind, repo_key, finding_idx)`` where ``kind`` is
-    either ``"repo"`` (then ``finding_idx`` is None) or ``"finding"``.
-    Findings only appear when their repo is expanded - collapsing a
-    repo removes its findings from the cursor reachable set.
+    Each item is ``(kind, repo_key, ref)``:
+      - ``"repo"``    -> ref is None
+      - ``"commit"``  -> ref is the commit SHA (shown when the repo is
+        expanded)
+      - ``"finding"`` -> ref is ``(sha, finding_idx)`` (shown when that
+        commit is expanded)
 
-    Within an expanded repo, findings are ordered by severity
-    (CRITICAL -> HIGH -> MEDIUM -> LOW -> INFO) with stable secondary
-    ordering by emission index. Matches --review's behaviour so a
-    HIGH SQL-injection finding doesn't sit buried under fifteen
-    INFO "type ignore comment" rows.
+    Collapsing a repo removes its commits (and their findings) from the
+    cursor-reachable set; collapsing a commit removes just its findings.
+    Findings within a commit are severity-ordered.
     """
+    commit_expanded = commit_expanded or {}
+    repo_show_all = repo_show_all or {}
     items = []
     for key in keys:
         items.append(("repo", key, None))
-        if repo_expanded.get(key, False):
-            entry = state.get("repos", {}).get(key) or {}
-            findings = entry.get("findings") or []
-            sorted_idx = sorted(
-                range(len(findings)),
-                key=lambda i: (
-                    -SEVERITY_ORDER.get(
-                        (findings[i].get("severity") or "INFO").upper(), 0,
-                    ),
-                    i,  # stable: preserve emission order within severity
-                ),
-            )
-            for i in sorted_idx:
-                items.append(("finding", key, i))
+        if not repo_expanded.get(key, False):
+            continue
+        entry = state.get("repos", {}).get(key) or {}
+        commits = entry.get("commits") or {}
+        # Findings-first by default: clean commits collapse into the
+        # repo row's "N clean hidden" summary so a big catch-up reads as
+        # the few commits that matter, not a wall. [f] reveals them all.
+        show_all = repo_show_all.get(key, False)
+        for sha in entry.get("order") or []:
+            rec = commits.get(sha) or {}
+            findings = rec.get("findings") or []
+            if not show_all and not findings:
+                continue
+            items.append(("commit", key, sha))
+            if not commit_expanded.get((key, sha), False):
+                continue
+            for i in _sorted_finding_indices(findings):
+                items.append(("finding", key, (sha, i)))
     return items
 
 
@@ -617,14 +1055,16 @@ def _render_monitor(
     items: list,
     cursor: int,
     repo_expanded: dict,
+    commit_expanded: dict,
     finding_expanded: dict,
     finding_marked: dict,
     status_line: str,
+    repo_show_all: Optional[dict] = None,
 ) -> None:
     """Full-screen redraw of the monitor dashboard.
 
-    ``items`` is the flat (repo + finding) list the cursor indexes
-    into; ``keys`` is the repo subset used for the header count.
+    ``items`` is the flat (repo + commit + finding) list the cursor
+    indexes into; ``keys`` is the repo subset used for the header count.
     Output is buffered and emitted by ``emit_tui_frame`` so the
     terminal repaints in one pass.
     """
@@ -636,8 +1076,8 @@ def _render_monitor(
     with contextlib.redirect_stdout(buf):
         _render_monitor_into_buffer(
             state, keys, items, cursor,
-            repo_expanded, finding_expanded, finding_marked, status_line,
-            width, height,
+            repo_expanded, commit_expanded, finding_expanded, finding_marked,
+            status_line, width, height, repo_show_all or {},
         )
     emit_tui_frame(buf.getvalue())
 
@@ -648,14 +1088,17 @@ def _render_monitor_into_buffer(
     items: list,
     cursor: int,
     repo_expanded: dict,
+    commit_expanded: dict,
     finding_expanded: dict,
     finding_marked: dict,
     status_line: str,
     width: int,
     height: int,
+    repo_show_all: Optional[dict] = None,
 ) -> None:
     """Inner render body. ``sys.stdout`` is redirected to the frame
     buffer by ``_render_monitor``; this function just emits lines."""
+    repo_show_all = repo_show_all or {}
     n_repos = len(keys)
 
     header_lines = [
@@ -664,7 +1107,8 @@ def _render_monitor_into_buffer(
         ),
         ui.dim(
             "  up/down navigate   enter toggle   -/= collapse/expand all   "
-            "space=strike   v=mark viewed   e=export   r=refresh   q=quit"
+            "space=strike   v=mark viewed   f=show all   e=export   "
+            "r=refresh   q=quit"
         ),
     ]
     header_lines += capture(_print_legend)
@@ -684,36 +1128,54 @@ def _render_monitor_into_buffer(
 
     # Render each item into a buffer so we can measure for windowing.
     item_blocks = []
-    for i, (kind, key, idx) in enumerate(items):
+    for i, (kind, key, ref) in enumerate(items):
+        entry = state.get("repos", {}).get(key) or {}
+        commits = entry.get("commits") or {}
+        new_shas = _new_commit_shas(entry)
         if kind == "repo":
-            entry = state.get("repos", {}).get(key) or {}
             block = capture(
                 _render_monitor_row,
                 entry,
                 is_expanded=repo_expanded.get(key, False),
                 is_current=(i == cursor),
                 width=width,
+                show_all=repo_show_all.get(key, False),
+                new_shas=new_shas,
             )
-        else:  # finding
-            entry = state.get("repos", {}).get(key) or {}
-            findings = entry.get("findings") or []
+        elif kind == "commit":
+            rec = commits.get(ref)
+            if rec is None:
+                block = [ui.dim("     (commit gone)")]
+            else:
+                block = capture(
+                    _render_monitor_commit_row,
+                    rec,
+                    is_expanded=commit_expanded.get((key, ref), False),
+                    is_current=(i == cursor),
+                    width=width,
+                    is_new=(ref in new_shas),
+                )
+        else:  # finding, ref == (sha, finding_idx)
+            sha, idx = ref
+            rec = commits.get(sha) or {}
+            findings = rec.get("findings") or []
             if idx is None or idx >= len(findings):
-                block = [ui.dim("        (finding gone)")]
+                block = [ui.dim("            (finding gone)")]
             else:
                 try:
                     f = _finding_from_state_dict(findings[idx])
                 except (TypeError, KeyError):
-                    block = [ui.dim("        (finding malformed)")]
+                    block = [ui.dim("            (finding malformed)")]
                 else:
                     diff_lines = _deserialize_diff_lines(
-                        entry.get("diff_lines") or {}
+                        rec.get("diff_lines") or {}
                     )
                     block = capture(
                         _render_monitor_finding_row,
                         f,
-                        is_expanded=finding_expanded.get((key, idx), False),
+                        is_expanded=finding_expanded.get((key, sha, idx), False),
                         is_current=(i == cursor),
-                        is_marked=finding_marked.get((key, idx), False),
+                        is_marked=finding_marked.get((key, sha, idx), False),
                         width=width,
                         diff_lines=diff_lines,
                     )
@@ -781,17 +1243,18 @@ def _ensure_repo_entries(state: dict, config: dict) -> dict:
                 "branch": branch,
                 "last_audited_sha": None,
                 "last_viewed_sha": None,
-                "last_audited_commit_date": None,
+                "head_sha": None,
                 "audited_at": None,
-                "findings": [],
-                "diff_lines": {},
+                "commits": {},
+                "order": [],
             }
         else:
             entry["name"] = name
             entry["url"] = url
             entry["branch"] = branch
-            entry.setdefault("diff_lines", {})
-            entry.setdefault("last_audited_commit_date", None)
+            entry.setdefault("commits", {})
+            entry.setdefault("order", [])
+            entry.setdefault("head_sha", entry.get("last_audited_sha"))
     return state
 
 
@@ -822,18 +1285,25 @@ def interactive_monitor(
     """Open the monitor TUI: dashboard of configured repos with cached
     findings, refreshable on demand.
 
+    The tree has three levels: repo -> commit -> finding. Expanding a
+    repo reveals its audited commits; expanding a commit reveals that
+    commit's findings.
+
     Keys:
       up / down         navigate
       enter             toggle expand / collapse on the current row
       right             expand
       left              collapse
-      -                 collapse everything (all repos + all findings)
+      -                 collapse everything (repos, commits, findings)
       =                 expand everything
       space             toggle strike-through on the current finding
                         (also collapses if it was expanded). On a repo
-                        row this is a no-op.
-      v                 mark the current repo viewed (clears [updated])
-      r                 refresh (poll all repos, audit anything new)
+                        or commit row this is a no-op.
+      v                 mark viewed up to the current row (repo -> all,
+                        commit/finding -> that commit and older)
+      f                 show all commits / findings-first for the repo
+                        (clean commits are hidden by default)
+      r                 refresh (audit every new commit since last scan)
       q, esc, Ctrl-C    save state and quit
     """
     if (not ui.CbreakTerminal.available
@@ -861,15 +1331,21 @@ def interactive_monitor(
     # before any refresh has populated last_audited_sha.
     _ensure_repo_entries(state, config)
     keys = _ordered_monitor_keys(state, config)
-    # Two expansion dictionaries: repo-level toggle controls which
-    # findings are reachable in the item list; finding-level toggle
-    # controls whether a finding renders as a one-liner or the full
-    # boxed card. Using dicts keyed by stable identifiers means the
-    # state survives a refresh that adds or reorders repos / findings.
+    # Three expansion dictionaries, one per tree level: repo controls
+    # which commits are reachable, commit controls which findings are
+    # reachable, finding controls one-liner vs full boxed card. Keyed by
+    # stable identifiers so the state survives a refresh that adds or
+    # reorders repos / commits / findings.
     repo_expanded: dict = {}
+    commit_expanded: dict = {}
     finding_expanded: dict = {}
     finding_marked: dict = {}
-    items = _build_monitor_items(state, keys, repo_expanded)
+    # Per-repo "show all commits" toggle ([f]). Off by default so clean
+    # commits collapse into the repo summary; on reveals every commit.
+    repo_show_all: dict = {}
+    items = _build_monitor_items(
+        state, keys, repo_expanded, commit_expanded, repo_show_all,
+    )
     cursor = 0
     status_line = "loaded cached state — press [r] to refresh"
 
@@ -877,28 +1353,30 @@ def interactive_monitor(
         """Rebuild the items list and try to keep the cursor on the
         same logical row across expand / collapse / refresh.
 
-        ``prev_anchor`` is the (kind, key, idx) tuple the cursor was
-        on before the change. If that exact item still exists in the
-        new list we land there; if it's been collapsed away (e.g.
-        cursor was on a finding under a repo that just closed), we
-        fall back to that repo's row.
+        ``prev_anchor`` is the (kind, key, ref) tuple the cursor was on
+        before the change. If that exact item still exists we land
+        there; otherwise we walk up the tree (finding -> its commit ->
+        its repo) to the nearest ancestor still on screen.
         """
         nonlocal items, cursor
-        items = _build_monitor_items(state, keys, repo_expanded)
+        items = _build_monitor_items(
+            state, keys, repo_expanded, commit_expanded, repo_show_all,
+        )
         if not items:
             cursor = 0
             return
         if prev_anchor is not None:
-            for i, it in enumerate(items):
-                if it == prev_anchor:
-                    cursor = i
-                    return
-            # Fall back: same repo, repo row.
-            kind, key, _ = prev_anchor
-            for i, it in enumerate(items):
-                if it[0] == "repo" and it[1] == key:
-                    cursor = i
-                    return
+            kind, key, ref = prev_anchor
+            ancestors = []
+            if kind == "finding" and isinstance(ref, tuple):
+                ancestors.append(("commit", key, ref[0]))
+            if kind in ("finding", "commit"):
+                ancestors.append(("repo", key, None))
+            for target in [prev_anchor, *ancestors]:
+                for i, it in enumerate(items):
+                    if it == target:
+                        cursor = i
+                        return
         cursor = min(cursor, len(items) - 1)
 
     _refresh_items()
@@ -908,8 +1386,8 @@ def interactive_monitor(
             while True:
                 _render_monitor(
                     state, keys, items, cursor,
-                    repo_expanded, finding_expanded, finding_marked,
-                    status_line,
+                    repo_expanded, commit_expanded, finding_expanded,
+                    finding_marked, status_line, repo_show_all,
                 )
                 try:
                     pressed = ui.read_key()
@@ -931,7 +1409,7 @@ def interactive_monitor(
                 elif pressed == "down" and items:
                     cursor = (cursor + 1) % len(items)
                 elif pressed in ("enter", "right", "left") and current:
-                    kind, key, idx = current
+                    kind, key, ref = current
                     if kind == "repo":
                         if pressed == "right":
                             new = True
@@ -941,8 +1419,20 @@ def interactive_monitor(
                             new = not repo_expanded.get(key, False)
                         repo_expanded[key] = new
                         _refresh_items(prev_anchor=current)
-                    else:  # finding
-                        ekey = (key, idx)
+                    elif kind == "commit":
+                        ekey = (key, ref)
+                        if pressed == "right":
+                            commit_expanded[ekey] = True
+                        elif pressed == "left":
+                            commit_expanded[ekey] = False
+                        else:
+                            commit_expanded[ekey] = (
+                                not commit_expanded.get(ekey, False)
+                            )
+                        _refresh_items(prev_anchor=current)
+                    else:  # finding, ref == (sha, idx)
+                        sha, idx = ref
+                        ekey = (key, sha, idx)
                         if pressed == "right":
                             finding_expanded[ekey] = True
                         elif pressed == "left":
@@ -952,9 +1442,10 @@ def interactive_monitor(
                                 not finding_expanded.get(ekey, False)
                             )
                 elif pressed == "space" and current:
-                    kind, key, idx = current
+                    kind, key, ref = current
                     if kind == "finding":
-                        ekey = (key, idx)
+                        sha, idx = ref
+                        ekey = (key, sha, idx)
                         if not finding_marked.get(ekey, False):
                             # Strike + collapse if the card was open.
                             finding_marked[ekey] = True
@@ -962,30 +1453,53 @@ def interactive_monitor(
                         else:
                             finding_marked[ekey] = False
                 elif pressed == "v" and current:
-                    kind, key, _ = current
-                    if kind == "repo":
-                        entry = state["repos"].get(key)
-                        if entry:
-                            entry["last_viewed_sha"] = entry.get("last_audited_sha")
-                            status_line = (
-                                f"marked '{entry.get('name', '?')}' viewed"
-                            )
+                    kind, key, ref = current
+                    entry = state["repos"].get(key)
+                    if entry and kind == "repo":
+                        # Whole repo: acknowledge up to the newest audit.
+                        entry["last_viewed_sha"] = entry.get("last_audited_sha")
+                        status_line = (
+                            f"marked '{entry.get('name', '?')}' viewed"
+                        )
+                    elif entry:
+                        # Commit / finding: acknowledge up to that commit
+                        # (and everything older). ref is the SHA on a
+                        # commit row, (sha, idx) on a finding row.
+                        sha = ref if kind == "commit" else ref[0]
+                        _mark_commit_viewed(entry, sha)
+                        status_line = f"marked {sha[:7]} viewed"
+                elif pressed == "f" and current:
+                    # Toggle showing every commit (incl. clean ones) for
+                    # the current repo. Auto-expands it so the newly
+                    # reachable commits render.
+                    _, key, _ = current
+                    show = not repo_show_all.get(key, False)
+                    repo_show_all[key] = show
+                    if show:
+                        repo_expanded[key] = True
+                    _refresh_items(prev_anchor=current)
+                    status_line = (
+                        "showing all commits" if show else "findings-first"
+                    )
                 elif pressed == "e":
                     # Export non-struck findings across every repo,
-                    # grouped by repo, to a timestamped markdown file
-                    # in the current directory. Strike marks are the
-                    # user's "resolved / ignore" signal so we drop
-                    # them; nothing in persistent state changes.
+                    # grouped by repo (flattening all of a repo's
+                    # commits under one heading), to a timestamped
+                    # markdown file. Strike marks are the user's
+                    # "resolved / ignore" signal so we drop them;
+                    # nothing in persistent state changes.
                     grouped = []
                     total_kept = 0
                     for key in keys:
                         entry = state.get("repos", {}).get(key) or {}
-                        raw = entry.get("findings") or []
-                        kept = [
-                            _finding_from_state_dict(d)
-                            for i, d in enumerate(raw)
-                            if not finding_marked.get((key, i), False)
-                        ]
+                        commits = entry.get("commits") or {}
+                        kept = []
+                        for sha in entry.get("order") or []:
+                            rec = commits.get(sha) or {}
+                            for i, d in enumerate(rec.get("findings") or []):
+                                if finding_marked.get((key, sha, i), False):
+                                    continue
+                                kept.append(_finding_from_state_dict(d))
                         total_kept += len(kept)
                         label = entry.get("name") or entry.get("url") or key
                         grouped.append((label, kept))
@@ -1001,21 +1515,32 @@ def interactive_monitor(
                     except OSError as exc:
                         status_line = f"export failed: {exc}"
                 elif pressed == "-":
-                    # Collapse everything: all repos closed, every
-                    # finding card closed.
+                    # Collapse everything: repos, commits, finding cards.
+                    # Also drop back to findings-first so re-expanding
+                    # starts from the uncluttered view.
                     repo_expanded.clear()
+                    commit_expanded.clear()
                     finding_expanded.clear()
+                    repo_show_all.clear()
                     _refresh_items(prev_anchor=current)
                     status_line = "collapsed all"
                 elif pressed == "=":
-                    # Expand everything: each repo open with all its
-                    # findings expanded. One-key overview.
+                    # Expand everything: every repo, every commit (incl.
+                    # clean ones), every finding card. Three passes
+                    # because each level only appears in the item list
+                    # once its parent is open.
                     for k in keys:
                         repo_expanded[k] = True
+                        repo_show_all[k] = True
                     _refresh_items(prev_anchor=current)
-                    for kind_, key_, idx_ in items:
+                    for kind_, key_, ref_ in items:
+                        if kind_ == "commit":
+                            commit_expanded[(key_, ref_)] = True
+                    _refresh_items(prev_anchor=current)
+                    for kind_, key_, ref_ in items:
                         if kind_ == "finding":
-                            finding_expanded[(key_, idx_)] = True
+                            sha_, i_ = ref_
+                            finding_expanded[(key_, sha_, i_)] = True
                     status_line = "expanded all"
                 elif pressed == "r":
                     if runtime.debug_mode:
@@ -1055,8 +1580,8 @@ def interactive_monitor(
                         status_line = "refreshing..."
                         _render_monitor(
                             state, keys, items, cursor,
-                            repo_expanded, finding_expanded, finding_marked,
-                            status_line,
+                            repo_expanded, commit_expanded, finding_expanded,
+                            finding_marked, status_line, repo_show_all,
                         )
 
                         def _progress(i, total, name, msg):
@@ -1066,8 +1591,9 @@ def interactive_monitor(
                             )
                             _render_monitor(
                                 state, keys, items, cursor,
-                                repo_expanded, finding_expanded,
-                                finding_marked, status_line,
+                                repo_expanded, commit_expanded,
+                                finding_expanded, finding_marked, status_line,
+                                repo_show_all,
                             )
 
                         try:

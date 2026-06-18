@@ -45,7 +45,10 @@ LARGE_PROMPT_TOKEN_THRESHOLD = 50_000
 
 # Monitor mode state-file constants.
 MONITOR_STATE_FILENAME = ".pwnguard-monitor.json"
-MONITOR_STATE_VERSION = 1
+# v2 moved per-commit findings under a SHA-keyed `commits` map (was a
+# single flat findings list keyed off last_audited_sha in v1). The
+# loader migrates v1 files in place on first read.
+MONITOR_STATE_VERSION = 2
 
 
 DEFAULT_CONFIG = {

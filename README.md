@@ -1,6 +1,6 @@
 # PwnGuard
 
-> **Status: Proof of Concept (`v0.2.5`).**
+> **Status: Proof of Concept (`v0.2.6`).**
 > PwnGuard is an open-source security tool by Shiva Kerdel (Power to Logic).
 > It flags risky code when committing your work, so issues surface during
 > development instead of in production. Proof of concept: flags and config
@@ -319,7 +319,7 @@ Every flag accepted by `pwnguard`. Default values come from
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--chunk-per-file` | off (auto-enabled on overflow) | Split the diff at `diff --git` boundaries and scan each file separately, then merge findings. Auto-enabled when the estimated prompt+response exceeds Ollama's `num_ctx`. See [docs/ollama-guide.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/ollama-guide.md). |
-| `--ollama-format {json,raw}` | `json` | Ollama output mode. `json` forces valid JSON via constrained generation (reliable, ~2x slower on 7B). `raw` lets the model emit freely (faster, relies on PwnGuard's parse fallbacks). |
+| `--format {json,raw}` | `json` for ollama, `raw` for openai-compat | Model output mode (alias: `--ollama-format`). `json` constrains output to valid JSON (Ollama constrained generation; openai-compat `response_format=json_object`): reliable but slower, and not supported by every openai-compat server. `raw` lets the model emit freely and relies on PwnGuard's parse fallbacks. |
 
 ### Environment / credentials
 

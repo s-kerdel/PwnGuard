@@ -1,13 +1,17 @@
 """Tests for the monitor refresh cycle.
 
 End-to-end behaviour:
-  - First encounter records the head as baseline, never invokes the LLM.
-  - No-new-commits path is a no-op (no LLM call, status 'unchanged').
-  - New commit triggers an audit, findings land in state.
+  - First encounter audits HEAD (so the dashboard shows current state).
+  - Identical range is a no-op (status 'unchanged', no LLM call).
+  - A forward range audits every new commit oldest-first, advancing the
+    pointer contiguously.
+  - The per-refresh cap bounds LLM calls and reports the deferred backlog.
+  - Already-cached SHAs are deduped (never re-audited).
+  - A diverged (force-push) range falls back to auditing HEAD only.
   - Per-repo errors are isolated and don't abort the whole cycle.
 
-The audit + diff-fetch + list-commits layers are mocked - we're
-testing the orchestration, not the platform plumbing (that lives in
+The audit + diff-fetch + list-commits + compare layers are mocked - we
+test the orchestration, not the platform plumbing (that lives in
 test_list_commits.py and test_fetch_url.py).
 """
 import pytest
@@ -34,46 +38,67 @@ def cfg():
 
 @pytest.fixture
 def state():
-    return {"version": 1, "repos": {}}
+    return {"version": 2, "repos": {}}
 
 
 @pytest.fixture
 def patched(monkeypatch):
-    """Replace network + audit calls with recorders so the cycle
-    becomes deterministic + offline."""
-    calls = {"list": [], "audit": []}
+    """Replace network + audit calls with recorders so the cycle becomes
+    deterministic + offline.
+
+    ``head``       url -> [(sha, date), ...] returned by list_commits_from_url
+    ``next_range`` url -> (status, [(sha, date), ...]) for the compare call
+    """
+    calls = {"list": [], "range": [], "audit": []}
+    calls["head"] = {}
+    calls["next_range"] = {}
+    calls["next_findings"] = {}
+    calls["next_diff_lines"] = {}
 
     def fake_list(url, branch, limit=1):
         calls["list"].append((url, branch, limit))
-        # Caller-controlled responses via the dict below. Each entry
-        # may be a list of bare SHAs (back-compat) or list of
-        # (sha, date) tuples (current shape).
-        raw = calls["next_shas"].get(url, [])
-        return [
-            x if isinstance(x, tuple) else (x, None)
-            for x in raw
-        ]
+        raw = calls["head"].get(url, [])
+        return [x if isinstance(x, tuple) else (x, None) for x in raw]
+
+    def fake_range(url, branch, base, limit=100):
+        calls["range"].append((url, branch, base, limit))
+        status, commits = calls["next_range"].get(url, ("identical", []))
+        norm = [c if isinstance(c, tuple) else (c, None) for c in commits]
+        return status, norm
 
     def fake_audit(repo_url, sha, config, backend):
         calls["audit"].append((repo_url, sha))
         result = audit.AuditResult()
-        # Return whatever findings the test pre-loaded.
         for f in calls["next_findings"].get((repo_url, sha), []):
             result.findings.append(f)
-        # _audit_commit_for_monitor returns (result, diff_lines).
         diff_lines = calls["next_diff_lines"].get((repo_url, sha), {})
         return result, diff_lines
 
-    # _run_monitor_refresh lives in pwnguard.monitor and calls these
-    # via its own module-level bindings, so we patch them on the source
-    # module rather than the audit.py re-export shim.
     monkeypatch.setattr(pwnguard.monitor, "list_commits_from_url", fake_list)
-    monkeypatch.setattr(pwnguard.monitor, "_audit_commit_for_monitor", fake_audit)
-
-    calls["next_shas"] = {}
-    calls["next_findings"] = {}
-    calls["next_diff_lines"] = {}
+    monkeypatch.setattr(
+        pwnguard.monitor, "list_commit_range_from_url", fake_range,
+    )
+    monkeypatch.setattr(
+        pwnguard.monitor, "_audit_commit_for_monitor", fake_audit,
+    )
     return calls
+
+
+def _audited_entry(name, url, sha, findings=None):
+    """A repo entry already baselined at ``sha`` (single cached commit)."""
+    return {
+        "name": name, "url": url, "branch": "main",
+        "last_audited_sha": sha, "last_viewed_sha": sha, "head_sha": sha,
+        "audited_at": "2026-05-15T09:00:00+00:00",
+        "commits": {
+            sha: {
+                "sha": sha, "date": None,
+                "audited_at": "2026-05-15T09:00:00+00:00",
+                "findings": findings or [], "diff_lines": {},
+            },
+        },
+        "order": [sha],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -81,12 +106,9 @@ def patched(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_first_encounter_audits_head(cfg, state, patched):
-    """A repo with no prior state gets its current HEAD audited on
-    the first refresh — strategy C as agreed, but applied to the
-    head commit so the user sees branch state immediately."""
-    patched["next_shas"] = {
-        "https://gitlab.com/g/alpha":   ["sha_a1"],
-        "https://github.com/o/beta":    ["sha_b1"],
+    patched["head"] = {
+        "https://gitlab.com/g/alpha": [("sha_a1", "2026-05-10T22:45:40Z")],
+        "https://github.com/o/beta":  [("sha_b1", None)],
     }
     finding = audit.Finding(
         severity="HIGH", title="sqli", file="x.py", line=10,
@@ -103,30 +125,30 @@ def test_first_encounter_audits_head(cfg, state, patched):
 
     summary = audit._run_monitor_refresh(cfg, state, "ollama")
 
-    # Both audited on first encounter, not baselined-without-audit.
-    assert set(summary.values()) == {"audited"}
+    assert all(s["status"] == "first-seen" for s in summary.values())
     assert set(patched["audit"]) == {
         ("https://gitlab.com/g/alpha", "sha_a1"),
         ("https://github.com/o/beta",  "sha_b1"),
     }
+    # The range/compare endpoint is never hit on first encounter.
+    assert patched["range"] == []
+
     key_a = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    entry_a = state["repos"][key_a]
+    assert entry_a["last_audited_sha"] == "sha_a1"
+    assert entry_a["head_sha"] == "sha_a1"
+    # First encounter sets viewed = audited so [updated] doesn't fire on
+    # something the user is staring at right now.
+    assert entry_a["last_viewed_sha"] == "sha_a1"
+    assert entry_a["order"] == ["sha_a1"]
+    rec = entry_a["commits"]["sha_a1"]
+    assert len(rec["findings"]) == 1
+    assert rec["date"] == "2026-05-10T22:45:40Z"
+    # diff_lines cached under the commit, JSON-safe (string keys).
+    assert rec["diff_lines"] == {"x.py": {"10": "    sql = f\"SELECT ...\""}}
+
     key_b = audit._repo_key("https://github.com/o/beta", "main")
-    assert state["repos"][key_a]["last_audited_sha"] == "sha_a1"
-    # First encounter sets viewed = audited so [updated] doesn't fire
-    # on something the user is staring at right now.
-    assert state["repos"][key_a]["last_viewed_sha"] == "sha_a1"
-    assert state["repos"][key_a]["audited_at"] is not None
-    assert len(state["repos"][key_a]["findings"]) == 1
-    # diff_lines cached alongside findings so the TUI can render the
-    # ±3 code preview without re-fetching. JSON-safe form: string keys.
-    assert state["repos"][key_a]["diff_lines"] == {
-        "x.py": {"10": "    sql = f\"SELECT ...\""},
-    }
-    # Commit date (from list_commits_from_url) is stored too so the
-    # dashboard can render a relative-time chip next to the SHA.
-    assert "last_audited_commit_date" in state["repos"][key_a]
-    assert state["repos"][key_b]["last_audited_sha"] == "sha_b1"
-    assert state["repos"][key_b]["findings"] == []
+    assert state["repos"][key_b]["commits"]["sha_b1"]["findings"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +174,7 @@ def test_deserialize_diff_lines_parses_string_keys_back():
 def test_deserialize_diff_lines_drops_malformed_rows():
     """A tampered cache with non-int line keys shouldn't crash."""
     out = audit._deserialize_diff_lines({
-        "x.py": {"10": "ok", "abc": "bad-key", "11": 12345},  # bad value type too
+        "x.py": {"10": "ok", "abc": "bad-key", "11": 12345},
     })
     assert out == {"x.py": {10: "ok", 11: ""}}
 
@@ -163,75 +185,384 @@ def test_deserialize_non_dict_returns_empty():
 
 
 # ---------------------------------------------------------------------------
-# No-change cycle (no LLM call)
+# No-change cycle (identical range, no LLM call)
 # ---------------------------------------------------------------------------
 
-def test_unchanged_repo_is_skipped(cfg, state, patched):
-    key_a = audit._repo_key("https://gitlab.com/g/alpha", "main")
-    state["repos"][key_a] = {
-        "name": "alpha", "url": "https://gitlab.com/g/alpha", "branch": "main",
-        "last_audited_sha": "sha_a1", "last_viewed_sha": "sha_a1",
-        "audited_at": "2026-05-15T09:00:00+00:00", "findings": [],
-    }
-    # alpha returns the same SHA it already audited.
-    patched["next_shas"] = {
-        "https://gitlab.com/g/alpha":   ["sha_a1"],
-        "https://github.com/o/beta":    ["sha_b1"],
-    }
-    # beta hasn't been seen yet, so it'll be audited on first encounter.
-
-    summary = audit._run_monitor_refresh(cfg, state, "ollama")
-
-    assert summary[key_a] == "unchanged"
-    # alpha unchanged -> no audit; beta first-encounter -> audited.
-    assert patched["audit"] == [("https://github.com/o/beta", "sha_b1")]
-
-
-# ---------------------------------------------------------------------------
-# New commit triggers an audit
-# ---------------------------------------------------------------------------
-
-def test_new_commit_triggers_audit_and_updates_state(cfg, state, patched):
-    # Pre-load BOTH repos as already audited so this test focuses on
-    # the new-commit path, not the first-encounter audits.
+def test_identical_range_is_unchanged(cfg, state, patched):
     key_a = audit._repo_key("https://gitlab.com/g/alpha", "main")
     key_b = audit._repo_key("https://github.com/o/beta", "main")
-    state["repos"][key_a] = {
-        "name": "alpha", "url": "https://gitlab.com/g/alpha", "branch": "main",
-        "last_audited_sha": "sha_a1", "last_viewed_sha": "sha_a1",
-        "audited_at": "2026-05-15T09:00:00+00:00", "findings": [],
-    }
-    state["repos"][key_b] = {
-        "name": "beta", "url": "https://github.com/o/beta", "branch": "main",
-        "last_audited_sha": "sha_b1", "last_viewed_sha": "sha_b1",
-        "audited_at": "2026-05-15T09:00:00+00:00", "findings": [],
-    }
-    # alpha advanced to sha_a2; beta is unchanged.
-    patched["next_shas"] = {
-        "https://gitlab.com/g/alpha":   ["sha_a2"],
-        "https://github.com/o/beta":    ["sha_b1"],
-    }
-    finding = audit.Finding(
-        severity="HIGH", title="sqli", file="x.py", line=10,
-        description="d", recommendation="r", anchor="a1",
+    state["repos"][key_a] = _audited_entry(
+        "alpha", "https://gitlab.com/g/alpha", "sha_a1",
     )
-    patched["next_findings"] = {
-        ("https://gitlab.com/g/alpha", "sha_a2"): [finding],
+    state["repos"][key_b] = _audited_entry(
+        "beta", "https://github.com/o/beta", "sha_b1",
+    )
+    patched["next_range"] = {
+        "https://gitlab.com/g/alpha": ("identical", []),
+        "https://github.com/o/beta":  ("identical", []),
     }
 
     summary = audit._run_monitor_refresh(cfg, state, "ollama")
 
-    assert summary[key_a] == "audited"
-    assert summary[key_b] == "unchanged"
-    # Only alpha was audited (beta unchanged).
-    assert patched["audit"] == [("https://gitlab.com/g/alpha", "sha_a2")]
-    assert state["repos"][key_a]["last_audited_sha"] == "sha_a2"
-    # last_viewed_sha stays at sha_a1 — this is a subsequent audit
-    # (not first-encounter), so the [updated] chip will fire until
-    # the user marks it viewed.
-    assert state["repos"][key_a]["last_viewed_sha"] == "sha_a1"
-    assert len(state["repos"][key_a]["findings"]) == 1
-    assert state["repos"][key_a]["findings"][0]["title"] == "sqli"
+    assert summary[key_a]["status"] == "unchanged"
+    assert summary[key_b]["status"] == "unchanged"
+    assert patched["audit"] == []  # nothing re-audited
+
+
+# ---------------------------------------------------------------------------
+# Forward range: every new commit audited oldest-first
+# ---------------------------------------------------------------------------
+
+def test_range_audits_all_commits_oldest_first(cfg, state, patched):
+    key_a = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    key_b = audit._repo_key("https://github.com/o/beta", "main")
+    state["repos"][key_a] = _audited_entry(
+        "alpha", "https://gitlab.com/g/alpha", "sha_a0",
+    )
+    state["repos"][key_b] = _audited_entry(
+        "beta", "https://github.com/o/beta", "sha_b0",
+    )
+    patched["next_range"] = {
+        "https://gitlab.com/g/alpha": ("ok", [
+            ("sha_a1", "d1"), ("sha_a2", "d2"), ("sha_a3", "d3"),
+        ]),
+        "https://github.com/o/beta": ("identical", []),
+    }
+
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    assert summary[key_a]["status"] == "audited"
+    assert summary[key_a]["audited"] == 3
+    assert summary[key_a]["backlog"] == 0
+    # Audited oldest -> newest.
+    assert patched["audit"] == [
+        ("https://gitlab.com/g/alpha", "sha_a1"),
+        ("https://gitlab.com/g/alpha", "sha_a2"),
+        ("https://gitlab.com/g/alpha", "sha_a3"),
+    ]
+    entry = state["repos"][key_a]
+    # Pointer advances to the newest audited commit.
+    assert entry["last_audited_sha"] == "sha_a3"
+    assert entry["head_sha"] == "sha_a3"
+    # order is newest-first: new commits sit ahead of the old baseline.
+    assert entry["order"] == ["sha_a3", "sha_a2", "sha_a1", "sha_a0"]
+    # Per-commit dates land on their own records.
+    assert entry["commits"]["sha_a2"]["date"] == "d2"
+
+
+# ---------------------------------------------------------------------------
+# Per-refresh cap + backlog reporting (no silent truncation)
+# ---------------------------------------------------------------------------
+
+def test_cap_limits_commits_and_reports_backlog(state, patched):
+    # review_everything_at_once off -> the cap is a hard stop and the
+    # remainder is reported as backlog for the next [r] press.
+    cfg = {"monitor": {
+        "repos": [{"name": "alpha",
+                   "url": "https://gitlab.com/g/alpha",
+                   "branch": "main"}],
+        "review_everything_at_once": False,
+        "max_commits_per_refresh": 2,
+    }}
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    state["repos"][key] = _audited_entry(
+        "alpha", "https://gitlab.com/g/alpha", "c0",
+    )
+    patched["next_range"] = {
+        "https://gitlab.com/g/alpha": ("ok", [
+            ("c1", None), ("c2", None), ("c3", None),
+            ("c4", None), ("c5", None),
+        ]),
+    }
+
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    assert summary[key]["audited"] == 2
+    assert summary[key]["backlog"] == 3
+    # Oldest two audited; the pointer advances only that far.
+    assert [s for (_, s) in patched["audit"]] == ["c1", "c2"]
+    entry = state["repos"][key]
+    assert entry["last_audited_sha"] == "c2"
+    # head_sha leads the pointer -> the dashboard shows a backlog chip.
+    assert entry["head_sha"] == "c5"
+    assert entry["pending_count"] == 3
+
+
+def test_head_sha_is_true_head_when_range_exceeds_ceiling(state, patched):
+    """When the compare window is truncated at the ceiling, head_sha
+    resolves to the real branch HEAD (extra list call) so the backlog
+    chip doesn't understate how far behind the pointer is."""
+    cfg = {"monitor": {
+        "repos": [
+            {"name": "alpha", "url": "https://gitlab.com/g/alpha", "branch": "main"},
+        ],
+        # Single-batch mode so the assertion targets the oldest cap-sized
+        # slice; HEAD resolution runs regardless of this knob.
+        "review_everything_at_once": False,
+    }}
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    state["repos"][key] = _audited_entry(
+        "alpha", "https://gitlab.com/g/alpha", "c0",
+    )
+    # A full ceiling-sized window (default ceiling is 100).
+    window = [(f"c{i:03d}", None) for i in range(1, 101)]
+    patched["next_range"] = {"https://gitlab.com/g/alpha": ("ok", window)}
+    # The true HEAD lives beyond the truncated window.
+    patched["head"] = {"https://gitlab.com/g/alpha": [("REALHEAD", None)]}
+
+    audit._run_monitor_refresh(cfg, state, "ollama")
+
+    entry = state["repos"][key]
+    assert entry["head_sha"] == "REALHEAD"
+    # Default cap audits the oldest 10 of the window.
+    assert [s for (_, s) in patched["audit"]] == [f"c{i:03d}" for i in range(1, 11)]
+
+
+# ---------------------------------------------------------------------------
+# review_everything_at_once: one refresh catches the branch fully up
+# ---------------------------------------------------------------------------
+
+def test_review_everything_at_once_drains_past_cap(state, patched):
+    """With the knob on (default), a single refresh audits the whole
+    window even when it exceeds max_commits_per_refresh - the cap only
+    sizes the progress batch, it doesn't stop the drain."""
+    cfg = {"monitor": {
+        "repos": [{"name": "alpha",
+                   "url": "https://gitlab.com/g/alpha",
+                   "branch": "main"}],
+        "max_commits_per_refresh": 2,  # smaller than the window on purpose
+    }}
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    state["repos"][key] = _audited_entry(
+        "alpha", "https://gitlab.com/g/alpha", "c0",
+    )
+    patched["next_range"] = {
+        "https://gitlab.com/g/alpha": ("ok", [
+            ("c1", None), ("c2", None), ("c3", None),
+            ("c4", None), ("c5", None),
+        ]),
+    }
+
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    assert summary[key]["audited"] == 5
+    assert summary[key]["backlog"] == 0
+    assert [s for (_, s) in patched["audit"]] == ["c1", "c2", "c3", "c4", "c5"]
+    entry = state["repos"][key]
+    assert entry["last_audited_sha"] == "c5"
+    assert entry["head_sha"] == "c5"
+    assert entry["pending_count"] == 0
+
+
+def test_review_everything_at_once_drains_across_windows(state, patched, monkeypatch):
+    """A backlog larger than the compare-window ceiling is drained by
+    re-fetching the next window from the advanced pointer until the
+    branch is caught up - all in one refresh."""
+    # Shrink the ceiling so two commits fill a window without needing a
+    # 100-commit fixture; cap matches so ceiling == 2.
+    monkeypatch.setattr(pwnguard.monitor, "_RANGE_FETCH_CEILING", 2)
+    cfg = {"monitor": {
+        "repos": [{"name": "alpha",
+                   "url": "https://gitlab.com/g/alpha",
+                   "branch": "main"}],
+        "max_commits_per_refresh": 2,
+    }}
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    state["repos"][key] = _audited_entry(
+        "alpha", "https://gitlab.com/g/alpha", "c0",
+    )
+
+    # Each window starts after the pointer's current SHA (the `base`).
+    windows = {
+        "c0": ("ok", [("c1", None), ("c2", None)]),
+        "c2": ("ok", [("c3", None), ("c4", None)]),
+        "c4": ("ok", [("c5", None)]),  # short window -> caught up
+    }
+
+    def fake_range(url, branch, base, limit=100):
+        patched["range"].append((url, branch, base, limit))
+        return windows[base]
+    monkeypatch.setattr(
+        pwnguard.monitor, "list_commit_range_from_url", fake_range,
+    )
+    # HEAD lookups (fired when a window fills the ceiling) point past the
+    # window so the chip never understates mid-drain.
+    patched["head"] = {"https://gitlab.com/g/alpha": [("c5", None)]}
+
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    assert summary[key]["audited"] == 5
+    assert summary[key]["backlog"] == 0
+    assert [s for (_, s) in patched["audit"]] == ["c1", "c2", "c3", "c4", "c5"]
+    entry = state["repos"][key]
+    assert entry["last_audited_sha"] == "c5"
+    assert entry["pending_count"] == 0
+    # Three windows fetched: c0.., c2.., c4...
+    assert [base for (_, _, base, _) in patched["range"]] == ["c0", "c2", "c4"]
+
+
+def test_review_everything_at_once_stops_on_mid_drain_diverged(state, patched, monkeypatch):
+    """If history is rewritten mid-drain, the catch-up loop stops at the
+    last good commit; the next refresh's diverged fallback handles it."""
+    monkeypatch.setattr(pwnguard.monitor, "_RANGE_FETCH_CEILING", 2)
+    cfg = {"monitor": {
+        "repos": [{"name": "alpha",
+                   "url": "https://gitlab.com/g/alpha",
+                   "branch": "main"}],
+        "max_commits_per_refresh": 2,
+    }}
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    state["repos"][key] = _audited_entry(
+        "alpha", "https://gitlab.com/g/alpha", "c0",
+    )
+    windows = {
+        "c0": ("ok", [("c1", None), ("c2", None)]),
+        "c2": ("diverged", []),  # force-push landed while we were auditing
+    }
+
+    def fake_range(url, branch, base, limit=100):
+        return windows[base]
+    monkeypatch.setattr(
+        pwnguard.monitor, "list_commit_range_from_url", fake_range,
+    )
+    patched["head"] = {"https://gitlab.com/g/alpha": [("c2", None)]}
+
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    assert [s for (_, s) in patched["audit"]] == ["c1", "c2"]
+    assert state["repos"][key]["last_audited_sha"] == "c2"
+    assert summary[key]["status"] == "audited"
+
+
+def test_backlog_drains_on_next_refresh(state, patched):
+    """A second refresh from the advanced pointer audits the next chunk -
+    no commit is permanently skipped."""
+    cfg = {"monitor": {
+        "repos": [{"name": "alpha",
+                   "url": "https://gitlab.com/g/alpha",
+                   "branch": "main"}],
+        "review_everything_at_once": False,
+        "max_commits_per_refresh": 2,
+    }}
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    state["repos"][key] = _audited_entry(
+        "alpha", "https://gitlab.com/g/alpha", "c0",
+    )
+    patched["next_range"] = {
+        "https://gitlab.com/g/alpha": ("ok", [
+            ("c1", None), ("c2", None), ("c3", None),
+        ]),
+    }
+    audit._run_monitor_refresh(cfg, state, "ollama")  # audits c1, c2
+
+    # Second pass: compare now returns only what's left of the range.
+    patched["audit"].clear()
+    patched["next_range"] = {
+        "https://gitlab.com/g/alpha": ("ok", [("c3", None)]),
+    }
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    assert [s for (_, s) in patched["audit"]] == ["c3"]
+    entry = state["repos"][key]
+    assert entry["last_audited_sha"] == "c3"
+    assert summary[key]["backlog"] == 0
+    assert entry["pending_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Dedup by SHA
+# ---------------------------------------------------------------------------
+
+def test_dedup_skips_already_cached_commits(state, patched):
+    cfg = {"monitor": {"repos": [
+        {"name": "alpha", "url": "https://gitlab.com/g/alpha", "branch": "main"},
+    ]}}
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    entry = _audited_entry("alpha", "https://gitlab.com/g/alpha", "sha_a1")
+    # c2 is already cached (e.g. audited in a prior, overlapping range).
+    entry["commits"]["c2"] = {
+        "sha": "c2", "date": None, "audited_at": "x",
+        "findings": [], "diff_lines": {},
+    }
+    entry["order"] = ["c2", "sha_a1"]
+    state["repos"][key] = entry
+    patched["next_range"] = {
+        "https://gitlab.com/g/alpha": ("ok", [("c2", None), ("c3", None)]),
+    }
+
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    # c2 already cached -> only c3 hits the model.
+    assert patched["audit"] == [("https://gitlab.com/g/alpha", "c3")]
+    assert summary[key]["audited"] == 1
+
+
+def test_range_all_cached_is_unchanged_not_error(state, patched):
+    """GitLab can return a compare range whose commits are all already
+    cached (overlapping range). That's 'caught up', not an error - it
+    must not surface as 'no commit audited'."""
+    cfg = {"monitor": {"repos": [
+        {"name": "alpha", "url": "https://gitlab.com/g/alpha", "branch": "main"},
+    ]}}
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    entry = _audited_entry("alpha", "https://gitlab.com/g/alpha", "c1")
+    entry["commits"]["c2"] = {
+        "sha": "c2", "date": None, "audited_at": "x",
+        "findings": [], "diff_lines": {},
+    }
+    entry["order"] = ["c2", "c1"]
+    state["repos"][key] = entry
+    # Compare returns only commits we've already audited.
+    patched["next_range"] = {
+        "https://gitlab.com/g/alpha": ("ok", [("c1", None), ("c2", None)]),
+    }
+
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    assert summary[key]["status"] == "unchanged"
+    assert patched["audit"] == []
+    assert state["repos"][key]["last_error"] is None
+
+
+# ---------------------------------------------------------------------------
+# Force-push / diverged fallback
+# ---------------------------------------------------------------------------
+
+def test_diverged_audits_head_only(state, patched):
+    cfg = {"monitor": {"repos": [
+        {"name": "alpha", "url": "https://gitlab.com/g/alpha", "branch": "main"},
+    ]}}
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    state["repos"][key] = _audited_entry(
+        "alpha", "https://gitlab.com/g/alpha", "sha_old",
+    )
+    patched["next_range"] = {"https://gitlab.com/g/alpha": ("diverged", [])}
+    patched["head"] = {"https://gitlab.com/g/alpha": [("sha_new", "d")]}
+
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    assert summary[key]["status"] == "diverged"
+    assert patched["audit"] == [("https://gitlab.com/g/alpha", "sha_new")]
+    entry = state["repos"][key]
+    assert entry["last_audited_sha"] == "sha_new"
+    assert entry["head_sha"] == "sha_new"
+
+
+def test_diverged_head_already_cached_is_unchanged(state, patched):
+    cfg = {"monitor": {"repos": [
+        {"name": "alpha", "url": "https://gitlab.com/g/alpha", "branch": "main"},
+    ]}}
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    state["repos"][key] = _audited_entry(
+        "alpha", "https://gitlab.com/g/alpha", "sha_x",
+    )
+    patched["next_range"] = {"https://gitlab.com/g/alpha": ("diverged", [])}
+    patched["head"] = {"https://gitlab.com/g/alpha": [("sha_x", None)]}
+
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    assert summary[key]["status"] == "unchanged"
+    assert patched["audit"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -239,28 +570,103 @@ def test_new_commit_triggers_audit_and_updates_state(cfg, state, patched):
 # ---------------------------------------------------------------------------
 
 def test_one_repo_error_does_not_abort_others(cfg, state, patched, monkeypatch):
-    # alpha will error on list_commits; beta should still proceed.
+    # alpha errors while listing HEAD on first encounter; beta proceeds.
     def fake_list(url, branch, limit=1):
         if "alpha" in url:
             raise SystemExit("alpha listing failed")
-        return ["sha_b1"]
+        return [("sha_b1", None)]
     monkeypatch.setattr(pwnguard.monitor, "list_commits_from_url", fake_list)
 
     summary = audit._run_monitor_refresh(cfg, state, "ollama")
 
     key_a = audit._repo_key("https://gitlab.com/g/alpha", "main")
     key_b = audit._repo_key("https://github.com/o/beta", "main")
-    assert summary[key_a].startswith("error")
-    # beta is first-encounter -> audited.
-    assert summary[key_b] == "audited"
+    assert summary[key_a]["status"] == "error"
+    assert summary[key_b]["status"] == "first-seen"
+
+
+def test_audit_error_mid_range_stops_batch_contiguously(state, patched, monkeypatch):
+    """If a commit's audit fails partway through a range, the pointer
+    stops at the last good commit (no gap) and the rest is backlog."""
+    cfg = {"monitor": {"repos": [
+        {"name": "alpha", "url": "https://gitlab.com/g/alpha", "branch": "main"},
+    ]}}
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    state["repos"][key] = _audited_entry(
+        "alpha", "https://gitlab.com/g/alpha", "c0",
+    )
+    patched["next_range"] = {
+        "https://gitlab.com/g/alpha": ("ok", [
+            ("c1", None), ("c2", None), ("c3", None),
+        ]),
+    }
+
+    def fake_audit(repo_url, sha, config, backend):
+        patched["audit"].append((repo_url, sha))
+        if sha == "c2":
+            raise SystemExit("model exploded")
+        return audit.AuditResult(), {}
+    monkeypatch.setattr(
+        pwnguard.monitor, "_audit_commit_for_monitor", fake_audit,
+    )
+
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    # c1 audited, c2 failed -> stop. Pointer stays at c1.
+    assert summary[key]["audited"] == 1
+    assert state["repos"][key]["last_audited_sha"] == "c1"
+    # c2 + c3 remain pending.
+    assert summary[key]["backlog"] == 2
 
 
 def test_missing_url_in_config_records_error(state, patched):
     bad_cfg = {"monitor": {"repos": [{"name": "broken", "branch": "main"}]}}
     summary = audit._run_monitor_refresh(bad_cfg, state, "ollama")
-    assert "broken" in summary
-    assert summary["broken"].startswith("error")
+    assert summary["broken"]["status"] == "error"
     assert patched["audit"] == []
+
+
+def test_refresh_records_last_error_on_entry(state, patched, monkeypatch):
+    """A fetch failure is stamped on the entry so the dashboard can show
+    the reason, not just count it."""
+    cfg = {"monitor": {"repos": [
+        {"name": "alpha", "url": "https://gitlab.com/g/alpha", "branch": "main"},
+    ]}}
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    state["repos"][key] = _audited_entry(
+        "alpha", "https://gitlab.com/g/alpha", "c0",
+    )
+
+    def boom(url, branch, base, limit=100):
+        raise SystemExit("HTTP 500 from compare endpoint")
+    monkeypatch.setattr(
+        pwnguard.monitor, "list_commit_range_from_url", boom,
+    )
+
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    assert summary[key]["status"] == "error"
+    assert state["repos"][key]["last_error"] == "HTTP 500 from compare endpoint"
+
+
+def test_refresh_clears_last_error_on_recovery(state, patched):
+    """A repo that errored last time clears its error once a refresh
+    succeeds, so the chip doesn't linger."""
+    key = audit._repo_key("https://gitlab.com/g/alpha", "main")
+    entry = _audited_entry("alpha", "https://gitlab.com/g/alpha", "c0")
+    entry["last_error"] = "stale boom from a previous refresh"
+    state["repos"][key] = entry
+    cfg = {"monitor": {"repos": [
+        {"name": "alpha", "url": "https://gitlab.com/g/alpha", "branch": "main"},
+    ]}}
+    patched["next_range"] = {
+        "https://gitlab.com/g/alpha": ("identical", []),
+    }
+
+    summary = audit._run_monitor_refresh(cfg, state, "ollama")
+
+    assert summary[key]["status"] == "unchanged"
+    assert state["repos"][key]["last_error"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -284,20 +690,17 @@ def test_empty_repos_list_returns_empty_summary(state, patched):
 # ---------------------------------------------------------------------------
 
 def test_progress_callback_fires_per_repo(cfg, state, patched):
-    patched["next_shas"] = {
-        "https://gitlab.com/g/alpha":   ["sha_a1"],
-        "https://github.com/o/beta":    ["sha_b1"],
+    patched["head"] = {
+        "https://gitlab.com/g/alpha": [("sha_a1", None)],
+        "https://github.com/o/beta":  [("sha_b1", None)],
     }
     seen = []
 
     def progress(idx, total, name, msg):
         seen.append((idx, total, name))
 
-    audit._run_monitor_refresh(
-        cfg, state, "ollama", progress=progress,
-    )
+    audit._run_monitor_refresh(cfg, state, "ollama", progress=progress)
 
-    # Each repo should produce at least one progress callback.
     names = {n for _, _, n in seen}
     assert names == {"alpha", "beta"}
     assert all(total == 2 for _, total, _ in seen)
@@ -307,15 +710,18 @@ def test_progress_callback_fires_per_repo(cfg, state, patched):
 # _summarise_refresh formatter
 # ---------------------------------------------------------------------------
 
-def test_summarise_refresh_counts_categories():
+def test_summarise_refresh_counts_commits_and_backlog():
     summary = {
-        "a": "audited", "b": "audited",
-        "c": "unchanged", "d": "error: boom",
+        "a": {"status": "audited", "audited": 3, "backlog": 0},
+        "b": {"status": "audited", "audited": 2, "backlog": 5},
+        "c": {"status": "unchanged", "audited": 0, "backlog": 0},
+        "d": {"status": "error", "audited": 0, "backlog": 0, "error": "boom"},
     }
     line = audit._summarise_refresh(summary)
-    assert "2 audited" in line
+    assert "5 commits audited" in line
     assert "1 unchanged" in line
     assert "1 error" in line
+    assert "5 pending" in line
 
 
 def test_summarise_refresh_handles_empty_summary():
@@ -323,61 +729,44 @@ def test_summarise_refresh_handles_empty_summary():
 
 
 # ---------------------------------------------------------------------------
-# _ordered_monitor_keys preserves config order
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # _ensure_repo_entries - placeholder rows for not-yet-refreshed repos
 # ---------------------------------------------------------------------------
 
 def test_ensure_creates_placeholder_for_each_configured_repo(cfg):
-    state = {"version": 1, "repos": {}}
+    state = {"version": 2, "repos": {}}
     audit._ensure_repo_entries(state, cfg)
     key_a = audit._repo_key("https://gitlab.com/g/alpha", "main")
     key_b = audit._repo_key("https://github.com/o/beta", "main")
     assert set(state["repos"]) == {key_a, key_b}
-    # Placeholder carries the configured name / url / branch.
     assert state["repos"][key_a]["name"] == "alpha"
     assert state["repos"][key_a]["url"] == "https://gitlab.com/g/alpha"
     assert state["repos"][key_a]["branch"] == "main"
-    # No audit data yet.
+    # No audit data yet: empty commit cache, null pointer.
     assert state["repos"][key_a]["last_audited_sha"] is None
-    assert state["repos"][key_a]["findings"] == []
+    assert state["repos"][key_a]["commits"] == {}
+    assert state["repos"][key_a]["order"] == []
 
 
 def test_ensure_preserves_existing_entry_data(cfg):
-    """Existing audited entries keep their findings + sha after ensure."""
+    """Existing audited entries keep their commits + pointer after ensure."""
     key = audit._repo_key("https://gitlab.com/g/alpha", "main")
-    state = {"version": 1, "repos": {
-        key: {
-            "name": "alpha",
-            "url": "https://gitlab.com/g/alpha",
-            "branch": "main",
-            "last_audited_sha": "sha_a1",
-            "last_viewed_sha": "sha_a1",
-            "audited_at": "2026-05-15T09:00:00+00:00",
-            "findings": [{"severity": "HIGH", "title": "t"}],
-        }
+    state = {"version": 2, "repos": {
+        key: _audited_entry(
+            "alpha", "https://gitlab.com/g/alpha", "sha_a1",
+            findings=[{"severity": "HIGH", "title": "t"}],
+        ),
     }}
     audit._ensure_repo_entries(state, cfg)
     assert state["repos"][key]["last_audited_sha"] == "sha_a1"
-    assert len(state["repos"][key]["findings"]) == 1
+    assert state["repos"][key]["commits"]["sha_a1"]["findings"][0]["title"] == "t"
 
 
 def test_ensure_refreshes_renamed_entry(cfg):
     """A config rename takes effect on the next ensure pass without
     losing audit data."""
     key = audit._repo_key("https://gitlab.com/g/alpha", "main")
-    state = {"version": 1, "repos": {
-        key: {
-            "name": "OLD-NAME",
-            "url": "https://gitlab.com/g/alpha",
-            "branch": "main",
-            "last_audited_sha": "sha_a1",
-            "last_viewed_sha": "sha_a1",
-            "findings": [],
-        }
-    }}
+    entry = _audited_entry("OLD-NAME", "https://gitlab.com/g/alpha", "sha_a1")
+    state = {"version": 2, "repos": {key: entry}}
     audit._ensure_repo_entries(state, cfg)
     assert state["repos"][key]["name"] == "alpha"
     assert state["repos"][key]["last_audited_sha"] == "sha_a1"
@@ -387,90 +776,140 @@ def test_ensure_skips_malformed_config_entries():
     """Bad config entries (no url / branch) don't create placeholders
     and don't crash the loop."""
     cfg = {"monitor": {"repos": [
-        {"name": "incomplete-1"},                       # no url, no branch
-        {"name": "incomplete-2", "url": "https://x"},  # no branch
+        {"name": "incomplete-1"},
+        {"name": "incomplete-2", "url": "https://x"},
         {"name": "ok", "url": "https://github.com/o/r", "branch": "main"},
     ]}}
-    state = {"version": 1, "repos": {}}
+    state = {"version": 2, "repos": {}}
     audit._ensure_repo_entries(state, cfg)
-    # Only the well-formed entry gets a placeholder.
     assert len(state["repos"]) == 1
     key = audit._repo_key("https://github.com/o/r", "main")
     assert key in state["repos"]
 
 
 # ---------------------------------------------------------------------------
-# _build_monitor_items orders findings by severity
+# _build_monitor_items: repo -> commit -> finding tree
 # ---------------------------------------------------------------------------
 
-def test_findings_sort_by_severity_inside_expanded_repo():
-    """High-severity findings must surface above low-severity noise -
-    matches --review's behaviour. Stable secondary order = emission
-    index so two findings of the same severity keep their relative
-    order from the model's response."""
+def _state_with_commit(findings):
     key = audit._repo_key("https://github.com/o/r", "main")
-    state = {"version": 1, "repos": {
+    sha = "c1"
+    state = {"version": 2, "repos": {
         key: {
             "name": "r", "url": "https://github.com/o/r", "branch": "main",
-            "findings": [
-                {"severity": "INFO",     "title": "info-1"},
-                {"severity": "HIGH",     "title": "high-1"},
-                {"severity": "INFO",     "title": "info-2"},
-                {"severity": "CRITICAL", "title": "crit-1"},
-                {"severity": "MEDIUM",   "title": "med-1"},
-                {"severity": "HIGH",     "title": "high-2"},
-            ],
+            "last_audited_sha": sha, "head_sha": sha, "order": [sha],
+            "commits": {sha: {"sha": sha, "findings": findings}},
         }
     }}
-    items = audit._build_monitor_items(state, [key], {key: True})
+    return state, key, sha
 
-    # Drop the repo header; rest are findings in render order, but
-    # each tuple contains the ORIGINAL state index. So we look up the
-    # original title to verify the sort.
-    finding_titles = [
-        state["repos"][k]["findings"][i]["title"]
-        for kind, k, i in items if kind == "finding"
+
+def test_commits_appear_only_when_repo_expanded():
+    state, key, sha = _state_with_commit([{"severity": "HIGH", "title": "h"}])
+    collapsed = audit._build_monitor_items(state, [key], {key: False}, {})
+    assert collapsed == [("repo", key, None)]
+    expanded = audit._build_monitor_items(state, [key], {key: True}, {})
+    assert ("commit", key, sha) in expanded
+    # Findings hidden until the commit itself is expanded.
+    assert not any(kind == "finding" for kind, _, _ in expanded)
+
+
+def _state_two_commits():
+    """One commit with a finding (c2), one clean (c1), repo expanded."""
+    key = audit._repo_key("https://github.com/o/r", "main")
+    state = {"version": 2, "repos": {
+        key: {
+            "name": "r", "url": "https://github.com/o/r", "branch": "main",
+            "last_audited_sha": "c2", "head_sha": "c2",
+            "order": ["c2", "c1"],
+            "commits": {
+                "c2": {"sha": "c2", "findings": [
+                    {"severity": "HIGH", "title": "h"},
+                ]},
+                "c1": {"sha": "c1", "findings": []},
+            },
+        }
+    }}
+    return state, key
+
+
+def test_clean_commits_hidden_by_default():
+    """Findings-first: a clean commit isn't a navigable row; the commit
+    with a finding still is."""
+    state, key = _state_two_commits()
+    items = audit._build_monitor_items(state, [key], {key: True}, {})
+    commit_shas = [ref for kind, _, ref in items if kind == "commit"]
+    assert commit_shas == ["c2"]  # c1 (clean) collapsed away
+
+
+def test_clean_commits_shown_with_show_all():
+    """[f] / show_all surfaces every commit, clean ones included."""
+    state, key = _state_two_commits()
+    items = audit._build_monitor_items(
+        state, [key], {key: True}, {}, {key: True},
+    )
+    commit_shas = [ref for kind, _, ref in items if kind == "commit"]
+    assert commit_shas == ["c2", "c1"]
+
+
+def test_findings_sort_by_severity_within_commit():
+    state, key, sha = _state_with_commit([
+        {"severity": "INFO",     "title": "info-1"},
+        {"severity": "HIGH",     "title": "high-1"},
+        {"severity": "INFO",     "title": "info-2"},
+        {"severity": "CRITICAL", "title": "crit-1"},
+        {"severity": "MEDIUM",   "title": "med-1"},
+        {"severity": "HIGH",     "title": "high-2"},
+    ])
+    items = audit._build_monitor_items(
+        state, [key], {key: True}, {(key, sha): True},
+    )
+    titles = [
+        state["repos"][k]["commits"][ref[0]]["findings"][ref[1]]["title"]
+        for kind, k, ref in items if kind == "finding"
     ]
-    assert finding_titles == [
-        "crit-1",   # CRITICAL first
-        "high-1", "high-2",  # then HIGH, emission order preserved
-        "med-1",    # MEDIUM
-        "info-1", "info-2",  # INFO last, emission order preserved
+    assert titles == [
+        "crit-1", "high-1", "high-2", "med-1", "info-1", "info-2",
     ]
 
 
 def test_findings_without_severity_default_to_info_at_end():
-    """A finding missing the severity field shouldn't crash sort;
-    it defaults to INFO and lands at the bottom."""
-    key = audit._repo_key("https://github.com/o/r", "main")
-    state = {"version": 1, "repos": {
-        key: {
-            "name": "r", "url": "https://github.com/o/r", "branch": "main",
-            "findings": [
-                {"title": "missing-sev"},  # no severity key
-                {"severity": "HIGH", "title": "high-1"},
-            ],
-        }
-    }}
-    items = audit._build_monitor_items(state, [key], {key: True})
+    state, key, sha = _state_with_commit([
+        {"title": "missing-sev"},
+        {"severity": "HIGH", "title": "high-1"},
+    ])
+    items = audit._build_monitor_items(
+        state, [key], {key: True}, {(key, sha): True},
+    )
     titles = [
-        state["repos"][k]["findings"][i]["title"]
-        for kind, k, i in items if kind == "finding"
+        state["repos"][k]["commits"][ref[0]]["findings"][ref[1]]["title"]
+        for kind, k, ref in items if kind == "finding"
     ]
     assert titles == ["high-1", "missing-sev"]
 
 
 # ---------------------------------------------------------------------------
-# _format_relative_time - just the edge cases worth pinning. The
-# per-granularity branches are integer division at multiples of 60 /
-# 3600 / 86400; testing them with timedeltas is both flaky (clock
-# advances during setup) and just verifies Python arithmetic.
+# _repo_all_findings aggregation
+# ---------------------------------------------------------------------------
+
+def test_repo_all_findings_flattens_across_commits():
+    entry = {
+        "order": ["c2", "c1"],
+        "commits": {
+            "c1": {"findings": [{"title": "a"}]},
+            "c2": {"findings": [{"title": "b"}, {"title": "c"}]},
+        },
+    }
+    titles = [f["title"] for f in audit._repo_all_findings(entry)]
+    # newest commit (c2) first, in order.
+    assert titles == ["b", "c", "a"]
+
+
+# ---------------------------------------------------------------------------
+# _format_relative_time edge cases
 # ---------------------------------------------------------------------------
 
 def test_relative_time_handles_z_suffix():
-    """GitHub returns UTC dates with 'Z' suffix; Python's
-    fromisoformat() before 3.11 didn't accept it - the helper has to
-    normalise. Empty string would mean the parse silently failed."""
     assert audit._format_relative_time("2026-05-13T10:00:00Z") != ""
 
 
@@ -481,8 +920,6 @@ def test_relative_time_returns_empty_on_garbage():
 
 
 def test_relative_time_clock_skew_returns_zero():
-    """A commit dated in the future (system clock skew between local
-    host and the platform's API) must not produce a negative count."""
     from datetime import datetime, timezone, timedelta
     future = datetime.now(timezone.utc) + timedelta(hours=2)
     assert audit._format_relative_time(future.isoformat()) == "0s"
@@ -495,7 +932,6 @@ def test_ordered_keys_follow_config_then_orphans(cfg):
         audit._repo_key("https://github.com/o/beta",  "main"): {},
     }}
     keys = audit._ordered_monitor_keys(state, cfg)
-    # alpha first, beta second (config order), then orphaned `old` at end.
     assert keys[0] == audit._repo_key("https://gitlab.com/g/alpha", "main")
     assert keys[1] == audit._repo_key("https://github.com/o/beta", "main")
     assert audit._repo_key("https://gitlab.com/g/old", "main") in keys[2:]

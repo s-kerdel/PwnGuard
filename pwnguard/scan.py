@@ -349,6 +349,10 @@ def run_scan(
     # Pre-flight checks for local backends. Printed BEFORE the spinner
     # so the heads-up appears first instead of after "Scanning with
     # ollama..." has already started counting.
+    # TODO(normalize): this overflow check + the dispatch/parse/resolve
+    # further down are duplicated in _audit_commit_for_monitor
+    # (monitor.py). Extract shared should_chunk() + audit_single_diff()
+    # helpers - deferred, see memory/project_monitor_audit_core_refactor.md.
     if backend == "ollama":
         # Build the same prompt the backend will see so the estimate is
         # accurate (slim vs full + framework hints affect total tokens).

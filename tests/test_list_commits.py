@@ -195,3 +195,156 @@ def test_build_commit_url_github():
 def test_build_commit_url_unknown_host_aborts():
     with pytest.raises(SystemExit):
         audit._build_commit_url("https://random-vcs.example/x/y", "abc")
+
+
+# ---------------------------------------------------------------------------
+# _valid_sha (guards forged base SHAs)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("sha,ok", [
+    ("abc1234", True),
+    ("a" * 40, True),
+    ("abc", False),                # too short
+    ("ABC1234", False),            # uppercase
+    ("abc/../etc", False),         # path injection
+    ("abc1234?ref=x", False),      # query injection
+    ("", False),
+])
+def test_valid_sha(sha, ok):
+    assert audit._valid_sha(sha) is ok
+
+
+# ---------------------------------------------------------------------------
+# list_commit_range_from_url - GitHub compare
+# ---------------------------------------------------------------------------
+
+def test_github_compare_maps_ahead_to_ok(captured):
+    captured["response"] = json.dumps({
+        "status": "ahead",
+        "commits": [
+            {"sha": "old1", "commit": {"committer": {"date": "d1"}}},
+            {"sha": "new2", "commit": {"committer": {"date": "d2"}}},
+        ],
+    }).encode()
+
+    status, commits = audit.list_commit_range_from_url(
+        "https://github.com/owner/repo", "main", "abc1230", limit=50,
+    )
+
+    assert status == "ok"
+    # oldest -> newest, as GitHub returns them.
+    assert commits == [("old1", "d1"), ("new2", "d2")]
+    assert "/compare/abc1230...main" in captured["url"]
+    assert "per_page=50" in captured["url"]
+
+
+def test_github_compare_identical_status(captured):
+    captured["response"] = json.dumps(
+        {"status": "identical", "commits": []}
+    ).encode()
+    status, commits = audit.list_commit_range_from_url(
+        "https://github.com/o/r", "main", "abc1230",
+    )
+    assert status == "identical"
+    assert commits == []
+
+
+@pytest.mark.parametrize("gh_status", ["behind", "diverged"])
+def test_github_compare_rewrite_maps_to_diverged(captured, gh_status):
+    captured["response"] = json.dumps(
+        {"status": gh_status, "commits": []}
+    ).encode()
+    status, _ = audit.list_commit_range_from_url(
+        "https://github.com/o/r", "main", "abc1230",
+    )
+    assert status == "diverged"
+
+
+# ---------------------------------------------------------------------------
+# list_commit_range_from_url - GitLab compare
+# ---------------------------------------------------------------------------
+
+def test_gitlab_compare_sorts_oldest_first(captured, monkeypatch):
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat")
+    # Deliberately out of order; the helper sorts by committed_date.
+    captured["response"] = json.dumps({
+        "commits": [
+            {"id": "newer", "committed_date": "2026-05-12T00:00:00Z"},
+            {"id": "older", "committed_date": "2026-05-10T00:00:00Z"},
+        ],
+    }).encode()
+
+    status, commits = audit.list_commit_range_from_url(
+        "https://gitlab.com/g/p", "main", "abc1230",
+    )
+
+    assert status == "ok"
+    assert commits == [
+        ("older", "2026-05-10T00:00:00Z"),
+        ("newer", "2026-05-12T00:00:00Z"),
+    ]
+    assert "/repository/compare" in captured["url"]
+    assert "from=abc1230" in captured["url"]
+    assert "to=main" in captured["url"]
+
+
+def test_gitlab_compare_sorts_oldest_first_with_missing_dates(captured, monkeypatch):
+    """Even when some commits lack committed_date, the dated ones are
+    ordered oldest -> newest and undated ones sort last (never trust the
+    raw API order)."""
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat")
+    captured["response"] = json.dumps({
+        "commits": [
+            {"id": "newer", "committed_date": "2026-05-12T00:00:00Z"},
+            {"id": "nodate"},
+            {"id": "older", "committed_date": "2026-05-10T00:00:00Z"},
+        ],
+    }).encode()
+
+    status, commits = audit.list_commit_range_from_url(
+        "https://gitlab.com/g/p", "main", "abc1230",
+    )
+
+    assert status == "ok"
+    assert commits == [
+        ("older", "2026-05-10T00:00:00Z"),
+        ("newer", "2026-05-12T00:00:00Z"),
+        ("nodate", None),
+    ]
+
+
+def test_gitlab_compare_empty_is_identical(captured, monkeypatch):
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat")
+    captured["response"] = json.dumps({"commits": []}).encode()
+    status, commits = audit.list_commit_range_from_url(
+        "https://gitlab.com/g/p", "main", "abc1230",
+    )
+    assert status == "identical"
+    assert commits == []
+
+
+def test_gitlab_compare_forwards_private_token(captured, monkeypatch):
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-range")
+    captured["response"] = json.dumps({"commits": []}).encode()
+    audit.list_commit_range_from_url(
+        "https://gitlab.com/g/p", "main", "abc1230",
+    )
+    assert captured["headers"].get("PRIVATE-TOKEN") == "glpat-range"
+
+
+# ---------------------------------------------------------------------------
+# list_commit_range_from_url - validation / dispatch
+# ---------------------------------------------------------------------------
+
+def test_range_rejects_invalid_base_sha(captured):
+    with pytest.raises(SystemExit):
+        audit.list_commit_range_from_url(
+            "https://github.com/o/r", "main", "../etc/passwd",
+        )
+
+
+def test_range_unknown_host_aborts(captured):
+    with pytest.raises(SystemExit):
+        audit.list_commit_range_from_url(
+            "https://random-vcs.example.com/o/r", "main", "abc123",
+        )

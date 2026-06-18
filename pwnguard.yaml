@@ -80,10 +80,10 @@ max_diff_lines: 500
 max_file_size_kb: 100
 
 # Monitor mode: when invoked with --monitor PwnGuard opens a TUI
-# dashboard that watches these repos, audits the latest commit on
-# each branch when it changes, and lets you step through findings
-# without re-running the audit. State is cached in
-# .pwnguard-monitor.json in the current working directory.
+# dashboard that watches these repos, audits every new commit between
+# the last scanned revision and HEAD (one per commit), and lets you
+# step through findings without re-running the audit. State is cached
+# in .pwnguard-monitor.json in the current working directory.
 # Uncomment and adapt:
 #
 # monitor:
@@ -94,3 +94,6 @@ max_file_size_kb: 100
 #     - name: vendor-fork
 #       url: https://github.com/owner/repo
 #       branch: upstream
+#   review_everything_at_once: true  # one refresh reviews all new changes (off: one batch per [r])
+#   max_commits_per_refresh: 10   # batch size per [r]; also the cap when review_everything_at_once is off
+#   keep_commits: 30              # retained audited commits per repo before pruning oldest
