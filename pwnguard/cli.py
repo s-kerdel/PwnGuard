@@ -105,6 +105,26 @@ class _WideHelpFormatter(argparse.RawDescriptionHelpFormatter):
         super().__init__(prog, max_help_position=32, **kwargs)
 
 
+# Config block holding the model string for each model-driven backend.
+# claude-code has none (it drives the `claude` CLI's own model).
+_BACKEND_MODEL_BLOCK = {
+    "claude-api": "claude_api",
+    "ollama": "ollama",
+    "openai-compat": "openai",
+}
+
+
+def _ci_run_banner(backend: str, config: dict) -> str:
+    """One-line ``PwnGuard vX  ·  backend  ·  model`` banner for CI logs, so
+    the pipeline output states which version and model ran (whether it's
+    current, and what review quality to expect)."""
+    block = _BACKEND_MODEL_BLOCK.get(backend)
+    model = config.get(block, {}).get("model") if block else None
+    head = f"{ui.bold('PwnGuard')} {ui.dim('v' + __version__)}"
+    sep = f"  {ui.dim('·')}  "
+    return f"{head}{sep}{backend}{sep}{model}" if model else f"{head}{sep}{backend}"
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="pwnguard",
@@ -534,6 +554,12 @@ def main():
         print(f"Threshold: {threshold}")
         sys.exit(0)
 
+    # In CI, state version + backend/model up front (before the scan, so
+    # it shows even if the backend later errors). Skipped for --json so
+    # stdout stays pure JSON.
+    if args.mode == "ci" and not args.json:
+        print(_ci_run_banner(backend, config))
+
     # Normal scan path.
     result, diff, diff_lines, files_scanned = run_scan(
         args, config, backend, max_file_size_kb,
@@ -593,7 +619,7 @@ def main():
         # Terminal output for CI logs
         print_terminal(
             result, threshold, diff_lines,
-            files_scanned=files_scanned, quiet=args.quiet,
+            files_scanned=files_scanned, quiet=args.quiet, ci=True,
         )
         # Post to GitLab MR. Defaults: resolvable thread + collapsed body.
         gitlab_cfg = config.get("gitlab", {})

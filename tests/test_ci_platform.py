@@ -11,7 +11,8 @@ import io
 import pytest
 
 import audit
-from pwnguard import runtime, ui
+from pwnguard import __version__, runtime, ui
+from pwnguard.cli import _ci_run_banner
 
 
 def _strip(text):
@@ -199,6 +200,30 @@ def test_no_color_beats_ci_env(monkeypatch):
 # ---------------------------------------------------------------------------
 # Configurable fallback width (CI panes are wider than 80)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# CI run banner (version + backend + model up front)
+# ---------------------------------------------------------------------------
+
+def test_ci_banner_shows_version_backend_and_model():
+    b = _strip(_ci_run_banner("claude-api", {"claude_api": {"model": "claude-opus-4-8"}}))
+    assert "PwnGuard" in b
+    assert f"v{__version__}" in b
+    assert "claude-api" in b
+    assert "claude-opus-4-8" in b
+
+
+def test_ci_banner_omits_model_for_claude_code():
+    b = _strip(_ci_run_banner("claude-code", {}))
+    assert "claude-code" in b
+    assert b.count("·") == 1   # version · backend, no model segment
+
+
+def test_ci_banner_reads_configured_model():
+    b = _strip(_ci_run_banner("ollama", {"ollama": {"model": "qwen2.5-coder:14b"}}))
+    assert "ollama" in b
+    assert "qwen2.5-coder:14b" in b
+
 
 def test_default_width_used_when_size_undetectable(monkeypatch):
     import os as _os

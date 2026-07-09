@@ -161,21 +161,20 @@ def _severity_marker(severity: str) -> str:
     return ui.severity_badge(severity, letter)
 
 
-def _print_legend() -> None:
+def _print_legend(indent: str = "") -> None:
     """Compact legend explaining the C/H/M/L/I/O letter badges.
 
     The `O` (observation) entry is only included when --show-observations
     is on, so users who haven't opted in don't see a legend item for
-    something they'll never produce.
+    something they'll never produce. ``indent`` left-pads the row so it can
+    line up with the finding rows (the sectioned CI layout indents both).
     """
     parts = []
     for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
         parts.append(f"{_severity_marker(sev)} {ui.dim(sev.lower())}")
     if runtime.show_observations:
         parts.append(f"{_severity_marker('OBSERVATION')} {ui.dim('observation')}")
-    # Flush-left: the legend is a top-level key, aligned with the scan
-    # header and the finding rows; only the finding content is indented.
-    print("  ".join(parts))
+    print(indent + "  ".join(parts))
 
 
 def _build_metadata(f: Finding) -> str:
@@ -560,17 +559,21 @@ def _render_finding_card(
     print(box_indent + bot)
 
 
-def _print_finding_block(f: Finding, diff_lines: dict) -> None:
+def _print_finding_block(
+    f: Finding, diff_lines: dict, outer_indent: str = "  ",
+) -> None:
     """Default layout: render the finding as a boxed card (or flat when
     ``_use_finding_card`` is False). Delegates to :func:`_render_finding_card`
     so the review TUI and the default output stay visually identical
-    apart from the cursor / checkbox nav prefix.
+    apart from the cursor / checkbox nav prefix. ``outer_indent`` is the
+    card's left margin (the sectioned CI layout tucks the body one column
+    left of the finding header).
     """
     _render_finding_card(
         f,
         diff_lines,
         width=ui.term_width(),
-        outer_indent="  ",
+        outer_indent=outer_indent,
     )
     print()
 
@@ -589,8 +592,13 @@ def _print_summary(result: AuditResult) -> None:
     print()
 
 
-def _print_footer(result: AuditResult, threshold: str) -> None:
-    """Result label (PASS/FAIL) + actionable next step."""
+def _print_footer(result: AuditResult, threshold: str, ci: bool = False) -> None:
+    """Result label (PASS/FAIL) + actionable next step.
+
+    The ``git commit`` / ``PWNGUARD_SKIP`` hint is hook-specific; ``ci``
+    drops it, since there's no local commit to retry or bypass in a
+    pipeline (the pipeline gate is the exit code).
+    """
     if result.exceeds_threshold(threshold):
         label = ui.bold(ui.red("FAIL"))
         threshold_rank = SEVERITY_ORDER.get(threshold, 3)
@@ -598,8 +606,12 @@ def _print_footer(result: AuditResult, threshold: str) -> None:
             1 for f in result.blocking_findings
             if SEVERITY_ORDER.get(f.severity, 0) >= threshold_rank
         )
-        print(f"{label}  Fix the {n} issue{'s' if n != 1 else ''} above, then `{ui.bold('git commit')}`.")
-        print(f"      Bypass once: {ui.dim('PWNGUARD_SKIP=1 git commit')}")
+        issues = f"{n} issue{'s' if n != 1 else ''}"
+        if ci:
+            print(f"{label}  Fix the {issues} above.")
+        else:
+            print(f"{label}  Fix the {issues} above, then `{ui.bold('git commit')}`.")
+            print(f"      Bypass once: {ui.dim('PWNGUARD_SKIP=1 git commit')}")
     else:
         label = ui.bold(ui.green("PASS"))
         print(f"{label}  No findings at or above {threshold} threshold.")
@@ -757,6 +769,7 @@ def print_terminal(
     *,
     files_scanned: int,
     quiet: bool = False,
+    ci: bool = False,
 ) -> None:
     """Render the audit result to the terminal in the grouped layout."""
     width = ui.term_width()
@@ -783,11 +796,14 @@ def print_terminal(
         return
 
     # Legend (only when there are findings; otherwise it's noise).
-    _print_legend()
-    print()
-
     platform = runtime.platform
     sectioned = platform in ("gitlab", "github") and not quiet
+
+    # In the sectioned CI layout the legend and the finding rows share a
+    # one-space indent (the badge adds a second column); the card body
+    # tucks one column further left when a finding is expanded.
+    _print_legend(indent=" " if sectioned else "")
+    print()
 
     if sectioned:
         # One collapsible section per finding, severity-ordered. The
@@ -797,12 +813,10 @@ def print_terminal(
         # the collapsed headers are the list.
         for i, f in enumerate(_ordered_findings(result)):
             sid = f"pwnguard_{i}"
-            # Indent the finding title to the card's 2-space margin so its
-            # left edge lines up with the card box below. The severity badge
-            # carries one leading space, so a single-space prefix lands the
-            # title at column 2. Only the legend and scan header sit flush-left.
+            # Header row aligns with the legend; the card body sits one
+            # column to its left (outer_indent below the header's prefix).
             _section_start(platform, sid, " " + _section_header(f))
-            _print_finding_block(f, diff_lines)
+            _print_finding_block(f, diff_lines, outer_indent="")
             _section_end(platform, sid)
     else:
         # Plain terminal / --quiet: no fold mechanism, so print the
@@ -828,4 +842,4 @@ def print_terminal(
     # when there were no observations (summary already left a blank).
     if result.observations:
         print()
-    _print_footer(result, threshold)
+    _print_footer(result, threshold, ci=ci)
