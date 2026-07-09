@@ -813,10 +813,10 @@ def print_terminal(
         # the collapsed headers are the list.
         for i, f in enumerate(_ordered_findings(result)):
             sid = f"pwnguard_{i}"
-            # Header row aligns with the legend; the card body sits one
-            # column to its left (outer_indent below the header's prefix).
+            # Header row is indented by the leading " " (plus the badge's
+            # own space); the card body sits one column to its left.
             _section_start(platform, sid, " " + _section_header(f))
-            _print_finding_block(f, diff_lines, outer_indent="")
+            _print_finding_block(f, diff_lines, outer_indent=" ")
             _section_end(platform, sid)
     else:
         # Plain terminal / --quiet: no fold mechanism, so print the

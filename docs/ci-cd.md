@@ -152,9 +152,10 @@ off, or name a platform explicitly if auto-detection guesses wrong.
 
 ## Suppress a false positive
 
-Do **not** reach for `allow_failure: true` or `--no-verify`: those drop
-the gate for everything. Add a `pwnguard:ignore` comment in the code under
-review instead (see the README's "Suppress a false positive" section). It
+Do **not** get past a false positive by loosening the gate for everyone
+(`--no-verify` locally, or raising `--threshold`). Add a `pwnguard:ignore`
+comment in the code under review instead (see the README's "Suppress a
+false positive" section). It
 travels in the PR/MR diff, so the next run re-scans and that one finding
 no longer blocks while the rest still count. The job log prints
 `N finding(s) suppressed inline` and `--json` includes a `suppressed` count.
