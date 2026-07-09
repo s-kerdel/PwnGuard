@@ -91,12 +91,19 @@ Add `ANTHROPIC_API_KEY` (and `GITLAB_TOKEN` for MR comments) as masked
 CI/CD variables. Leave them unprotected, or a feature-branch MR pipeline
 won't receive them.
 
-## Log output: overview + collapsible findings
+## Log output: collapsible findings
 
-In a pipeline, PwnGuard prints a **findings overview** (one severity-ordered
-row per finding) above the detailed cards, then wraps each detailed card in
-a **collapsible log section** that is folded by default - so the log opens on
-a scannable index and you expand only the finding you care about.
+In a pipeline, each finding is a **collapsible log section**, folded by
+default, whose header is that finding's row (severity, location, title,
+CWE). Collapsed, the log reads as a severity-ordered index; expand a
+header to reveal that finding's details. In a plain terminal, where the
+log can't fold, a **findings overview** table prints above the detailed
+cards instead.
+
+Inside GitLab/GitHub, PwnGuard forces ANSI color on (their logs render
+it even though stdout is a pipe) and widens the report to 120 columns.
+Set `COLUMNS` in the job to use a different width; `NO_COLOR=1` or
+`--no-color` turns color off.
 
 This is driven by `--platform`, which **auto-detects** the CI from its own
 environment variables and needs no wiring:

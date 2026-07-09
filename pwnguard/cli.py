@@ -490,6 +490,12 @@ def main():
             platform = "plain"
     runtime.set_platform(platform)
 
+    # CI log panes are far wider than the 80-column fallback used when
+    # stdout is a pipe with no detectable terminal size. Widen the default
+    # for GitLab/GitHub; COLUMNS (or a real terminal) still overrides.
+    if platform in ("gitlab", "github"):
+        ui.set_default_width(120)
+
     # Monitor mode: dashboard over the configured monitor.repos[]. Opens
     # the TUI immediately on cached state; [r] inside the TUI refreshes.
     # Short-circuits the normal scan path entirely - no diff source, no

@@ -53,8 +53,8 @@ from pwnguard.fetchers import (  # noqa: F401
 
 # Rendering helpers tested directly -----------------------------------------
 from pwnguard.render import (  # noqa: F401
-    _finding_header_plain,
     _print_finding_block,
+    _section_header,
     _truncate_visible,
     print_terminal,
 )

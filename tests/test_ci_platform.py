@@ -1,9 +1,9 @@
-"""Tests for --platform log rendering: findings overview + collapsible
-sections on GitLab / GitHub, and the plain fallback.
+"""Tests for --platform log rendering.
 
-The overview table prints on every platform (including local/plain); the
-section markers are platform-specific and must not leak into plain
-output where they'd be terminal noise.
+On GitLab / GitHub each finding is one collapsible log section whose
+header is the styled findings row - so the folded log is the overview
+and there is no separate index table. In plain / local output there is
+no fold mechanism, so an overview table prints above the detail cards.
 """
 import contextlib
 import io
@@ -11,7 +11,12 @@ import io
 import pytest
 
 import audit
-from pwnguard import runtime
+from pwnguard import runtime, ui
+
+
+def _strip(text):
+    """Drop ANSI/OSC escapes so assertions match the visible text."""
+    return ui._ANSI_RE.sub("", text)
 
 
 @pytest.fixture
@@ -72,12 +77,14 @@ def test_gitlab_wraps_each_finding_in_a_section(
     three_findings, diff_lines, restore_platform,
 ):
     out = _render(_result(three_findings), diff_lines, "gitlab")
-    # One start + one end marker per finding.
+    # One start + one end marker per finding, folded by default.
     assert out.count("\x1b[0Ksection_start:") == 3
     assert out.count("\x1b[0Ksection_end:") == 3
-    # Folded by default and carrying a scannable header.
     assert "[collapsed=true]" in out
-    assert "[C] shell.php:4 rce via cmd parameter CWE-78" in out
+    # Every finding's title rides in a section header.
+    plain = _strip(out)
+    for f in three_findings:
+        assert f.title in plain
 
 
 def test_gitlab_section_ids_are_unique(
@@ -86,7 +93,24 @@ def test_gitlab_section_ids_are_unique(
     out = _render(_result(three_findings), diff_lines, "gitlab")
     for i in range(3):
         assert f":pwnguard_{i}[collapsed=true]" in out
-        assert f"section_end:" in out and f":pwnguard_{i}\r" in out
+        assert f":pwnguard_{i}\r" in out
+
+
+def test_gitlab_headers_are_severity_ordered(
+    three_findings, diff_lines, restore_platform,
+):
+    plain = _strip(_render(_result(three_findings), diff_lines, "gitlab"))
+    # Both criticals precede the high in the section list.
+    assert plain.index("rce via cmd parameter") < plain.index("sql injection via id")
+    assert plain.index("command injection via host") < plain.index("sql injection via id")
+
+
+def test_gitlab_has_no_standalone_overview_table(
+    three_findings, diff_lines, restore_platform,
+):
+    # The collapsed headers ARE the index, so the separate table is gone.
+    out = _render(_result(three_findings), diff_lines, "gitlab")
+    assert "Findings (3)" not in _strip(out)
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +123,16 @@ def test_github_wraps_each_finding_in_a_group(
     out = _render(_result(three_findings), diff_lines, "github")
     assert out.count("::group::") == 3
     assert out.count("::endgroup::") == 3
-    assert "::group::[H] shell.php:10 sql injection via id CWE-89" in out
+    assert "sql injection via id" in _strip(out)
     # GitHub uses its own commands, never GitLab's section markers.
     assert "section_start:" not in out
+
+
+def test_github_has_no_standalone_overview_table(
+    three_findings, diff_lines, restore_platform,
+):
+    out = _render(_result(three_findings), diff_lines, "github")
+    assert "Findings (3)" not in _strip(out)
 
 
 # ---------------------------------------------------------------------------
@@ -112,46 +143,72 @@ def test_plain_has_overview_but_no_section_markers(
     three_findings, diff_lines, restore_platform,
 ):
     out = _render(_result(three_findings), diff_lines, "plain")
-    assert "Findings (3)" in out          # overview index prints
-    assert "section_start:" not in out    # no GitLab markers
-    assert "::group::" not in out         # no GitHub markers
-
-
-# ---------------------------------------------------------------------------
-# Overview behaviour
-# ---------------------------------------------------------------------------
-
-def test_overview_lists_every_finding(
-    three_findings, diff_lines, restore_platform,
-):
-    out = _render(_result(three_findings), diff_lines, "gitlab")
-    assert "Findings (3)" in out
-    for f in three_findings:
-        assert f.title in out
+    assert "Findings (3)" in _strip(out)   # overview index prints
+    assert "section_start:" not in out     # no GitLab markers
+    assert "::group::" not in out          # no GitHub markers
 
 
 def test_overview_skipped_for_single_finding(diff_lines, restore_platform):
     one = [_finding("HIGH", "sql injection via id", 10, "CWE-89")]
     out = _render(_result(one), diff_lines, "plain")
-    assert "Findings (1)" not in out
+    assert "Findings (1)" not in _strip(out)
     # But the finding itself still renders.
-    assert "sql injection via id" in out
+    assert "sql injection via id" in _strip(out)
 
 
 def test_quiet_suppresses_overview_and_sections(
     three_findings, diff_lines, restore_platform,
 ):
     out = _render(_result(three_findings), diff_lines, "gitlab", quiet=True)
-    assert "Findings (3)" not in out      # no overview in quiet mode
-    assert "section_start:" not in out    # no sections in quiet mode
+    assert "Findings (3)" not in _strip(out)   # no overview in quiet mode
+    assert "section_start:" not in out         # no sections in quiet mode
 
 
 # ---------------------------------------------------------------------------
-# Section header is ANSI-free (safe on both platforms)
+# Section header content
 # ---------------------------------------------------------------------------
 
-def test_finding_header_plain_has_no_ansi():
+def test_section_header_carries_row_fields_on_one_line():
     f = _finding("CRITICAL", "rce via cmd parameter", 4, "CWE-78")
-    header = audit._finding_header_plain(f)
-    assert "\x1b" not in header
-    assert header == "[C] shell.php:4 rce via cmd parameter CWE-78"
+    header = audit._section_header(f)
+    assert "\n" not in header               # single line (GitHub resets on \n)
+    plain = _strip(header)
+    assert "shell.php:4" in plain
+    assert "rce via cmd parameter" in plain
+    assert "CWE-78" in plain
+
+
+# ---------------------------------------------------------------------------
+# CI auto-forces color (logs render ANSI even without a PTY)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("ci_var", ["GITLAB_CI", "GITHUB_ACTIONS"])
+def test_ci_env_forces_color(monkeypatch, ci_var):
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv(ci_var, "true")
+    assert ui.should_use_color() is True
+
+
+def test_no_color_beats_ci_env(monkeypatch):
+    monkeypatch.setenv("GITLAB_CI", "true")
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert ui.should_use_color() is False
+
+
+# ---------------------------------------------------------------------------
+# Configurable fallback width (CI panes are wider than 80)
+# ---------------------------------------------------------------------------
+
+def test_default_width_used_when_size_undetectable(monkeypatch):
+    import os as _os
+    # Simulate a pipe with no terminal and no /dev/tty.
+    monkeypatch.setattr(ui.shutil, "get_terminal_size",
+                        lambda *_: _os.terminal_size((0, 24)))
+    monkeypatch.setattr(ui, "_tty_size", lambda: None)
+    saved = ui._default_width
+    try:
+        ui.set_default_width(120)
+        assert ui.term_width() == 120
+    finally:
+        ui._default_width = saved

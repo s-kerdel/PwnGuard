@@ -113,11 +113,24 @@ SEVERITY_FG_ON_BG = {
 
 _use_color = True
 
+# Fallback terminal width used when neither stdout, COLUMNS, nor /dev/tty
+# yields a size - i.e. a CI job with no PTY. cli.main() bumps this for CI
+# platforms whose log panes are far wider than the 80-column default.
+_default_width = 80
+
 
 def configure(*, color: bool = True) -> None:
     """Configure UI globals. Call once near startup, after parsing args."""
     global _use_color
     _use_color = color
+
+
+def set_default_width(cols: int) -> None:
+    """Set the fallback width term_width() returns when no size is
+    detectable (CI without a PTY). COLUMNS and a real terminal still take
+    precedence; this only replaces the hard-coded 80-column floor."""
+    global _default_width
+    _default_width = max(40, cols)
 
 
 def should_use_color(
@@ -130,6 +143,8 @@ def should_use_color(
       - NO_COLOR env var (https://no-color.org)
       - explicit --color flag
       - FORCE_COLOR env var
+      - known CI (GITLAB_CI / GITHUB_ACTIONS), whose logs render ANSI
+        even though stdout is a pipe there
       - non-TTY stdout (pipes, file redirects, CI logs without a PTY)
 
     The force path exists for git hook managers and CI runners that
@@ -143,6 +158,8 @@ def should_use_color(
     if force_color_flag:
         return True
     if os.environ.get("FORCE_COLOR"):
+        return True
+    if os.environ.get("GITLAB_CI") or os.environ.get("GITHUB_ACTIONS"):
         return True
     if not sys.stdout.isatty():
         return False
@@ -280,13 +297,16 @@ def _tty_size():
         return None
 
 
-def term_width(default: int = 80) -> int:
+def term_width(default: Optional[int] = None) -> int:
     """Detected terminal width, with a sane lower bound.
 
     Trusts stdout's width first (honoring the COLUMNS env var via
     shutil); when stdout is a pipe, falls back to the controlling
-    terminal through /dev/tty before the default.
+    terminal through /dev/tty, then to ``default`` (or the configured
+    ``_default_width`` when ``default`` is None).
     """
+    if default is None:
+        default = _default_width
     try:
         cols = shutil.get_terminal_size((0, 24)).columns
     except OSError:

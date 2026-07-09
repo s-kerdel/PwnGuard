@@ -663,23 +663,24 @@ def _print_observations(observations: list) -> None:
                 print(f"{BODY_INDENT}{ui.dim(line)}")
 
 
-def _finding_header_plain(f: Finding) -> str:
-    """Single-line, ANSI-free header for a collapsible log section.
+def _section_header(f: Finding) -> str:
+    """Styled one-line header for a collapsible CI section.
 
-    Shown as the fold title on GitLab/GitHub when the finding is
-    collapsed, so it has to read as a standalone summary: severity
-    letter, location, title, CWE. Kept free of escape codes because a
-    section-marker header is not a place we can rely on ANSI rendering
-    across both platforms.
+    Shown as the fold row on GitLab/GitHub, so the collapsed log reads as
+    the findings index: severity badge, location, title, CWE. Single line
+    and self-resetting (each ui.* helper closes its own escape) because
+    GitHub drops the active ANSI style on a newline - the styling must not
+    straddle one. Uses plain CWE text rather than the OSC 8 hyperlink the
+    detail card carries; link escapes in a section-marker header don't
+    render reliably.
     """
-    letter = SEVERITY_LETTER.get(f.severity.upper(), "?")
-    bits = [f"[{letter}]"]
+    parts = [_severity_marker(f.severity)]
     if f.file:
-        bits.append(f"{f.file}:{f.line}" if f.line else f.file)
-    bits.append(f.title)
+        parts.append(ui.dim_cyan(f"{f.file}:{f.line}" if f.line else f.file))
+    parts.append(ui.bold(f.title))
     if f.cwe:
-        bits.append(f.cwe)
-    return " ".join(bits)
+        parts.append(ui.dim(f.cwe))
+    return "  ".join(parts)
 
 
 def _section_start(platform: str, sid: str, header: str) -> None:
@@ -783,36 +784,35 @@ def print_terminal(
     _print_legend()
     print()
 
-    # Findings index above the details. Skipped in --quiet, where the
-    # per-file title rows already are the compact list.
-    if not quiet:
-        _print_overview(result)
-
-    # On GitLab/GitHub, fold each detailed card into a collapsible log
-    # section so the overview stays the scannable entry point. Plain and
-    # --quiet get no section markers (they'd be noise in a terminal).
     platform = runtime.platform
     sectioned = platform in ("gitlab", "github") and not quiet
-    sec_i = 0
 
-    # Both layouts group by file and share the title-row format.
-    # --quiet collapses to that one row; default mode adds the code
-    # snippet, description, and fix beneath.
-    for filepath, findings in _findings_by_file(result):
-        print(_file_header(filepath, findings))
-        if quiet:
-            for f in findings:
-                _print_finding_title_row(f, width)
-            print()
-        else:
-            for f in findings:
-                if sectioned:
-                    sid = f"pwnguard_{sec_i}"
-                    sec_i += 1
-                    _section_start(platform, sid, _finding_header_plain(f))
-                    _print_finding_block(f, diff_lines)
-                    _section_end(platform, sid)
-                else:
+    if sectioned:
+        # One collapsible section per finding, severity-ordered. The
+        # section header is the styled findings row, so the folded log
+        # already reads as the overview - expanding a header reveals that
+        # finding's card. No separate index table and no file grouping:
+        # the collapsed headers are the list.
+        for i, f in enumerate(_ordered_findings(result)):
+            sid = f"pwnguard_{i}"
+            _section_start(platform, sid, _section_header(f))
+            _print_finding_block(f, diff_lines)
+            _section_end(platform, sid)
+    else:
+        # Plain terminal / --quiet: no fold mechanism, so print the
+        # findings index above the details (skipped in --quiet, where the
+        # per-file title rows already are the compact list) and group the
+        # cards by file.
+        if not quiet:
+            _print_overview(result)
+        for filepath, findings in _findings_by_file(result):
+            print(_file_header(filepath, findings))
+            if quiet:
+                for f in findings:
+                    _print_finding_title_row(f, width)
+                print()
+            else:
+                for f in findings:
                     _print_finding_block(f, diff_lines)
 
     _print_summary(result)
