@@ -595,9 +595,16 @@ def main():
             result, threshold, diff_lines,
             files_scanned=files_scanned, quiet=args.quiet,
         )
-        # Post to GitLab MR
-        comment = format_gitlab_comment(result)
-        post_gitlab_comment(comment)
+        # Post to GitLab MR. Defaults: resolvable thread + collapsed body.
+        gitlab_cfg = config.get("gitlab", {})
+        collapsed = gitlab_cfg.get("comment_collapsed", True)
+        # Only open a resolvable thread when there's something to act on; a
+        # "passed" / error note shouldn't have to be resolved to merge.
+        as_thread = bool(gitlab_cfg.get("comment_as_thread", True)) and bool(
+            result.findings
+        )
+        comment = format_gitlab_comment(result, collapsed=collapsed)
+        post_gitlab_comment(comment, as_thread=as_thread)
     else:
         print_terminal(
             result, threshold, diff_lines,

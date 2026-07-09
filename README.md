@@ -437,6 +437,16 @@ Security guards: the URL scheme is restricted to `http` / `https` (no
 can never be forwarded across hosts; the destination host is printed
 on every run so a stealth yaml edit is visible.
 
+### `gitlab:` (MR comment posting)
+
+How findings are posted back to the merge request on `--mode ci --mr-diff`
+(needs `GITLAB_TOKEN` or `CI_JOB_TOKEN`).
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `comment_as_thread` | `true` | `true` posts a resolvable discussion thread (must be resolved before merge when the project requires resolved threads); `false` posts a plain, non-resolvable note. A clean pass / error is always a plain note. |
+| `comment_collapsed` | `true` | `true` wraps the finding detail in a folded `<details>` block, keeping the heading and severity tally visible; `false` posts the full detail inline. |
+
 ### Local override (`pwnguard.local.yaml`)
 
 PwnGuard also auto-loads a gitignored `pwnguard.local.yaml` (or

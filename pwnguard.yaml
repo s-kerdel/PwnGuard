@@ -49,6 +49,18 @@ ollama:
 #   temperature: 0.5
 #   seed: 42
 
+# GitLab MR comment posting (--mode ci --mr-diff). Controls how findings
+# are posted back to the merge request; needs GITLAB_TOKEN (or CI_JOB_TOKEN).
+gitlab:
+  # true  = post findings as a resolvable discussion thread - it must be
+  #         resolved before merge when the project requires resolved threads
+  # false = post as a plain, non-resolvable note
+  comment_as_thread: true
+  # true  = wrap the finding detail in a collapsed <details> block; the
+  #         heading and severity tally stay visible above it
+  # false = full inline comment
+  comment_collapsed: true
+
 # File patterns to skip (glob syntax)
 ignore_patterns:
   - "*.min.js"

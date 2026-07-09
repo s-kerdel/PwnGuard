@@ -51,32 +51,45 @@ def _ordered_for_export(findings: list) -> list:
     )
 
 
-def format_gitlab_comment(result: AuditResult) -> str:
-    """Format findings as a GitLab MR comment in markdown."""
+def format_gitlab_comment(result: AuditResult, *, collapsed: bool = False) -> str:
+    """Format findings as a GitLab MR comment in markdown.
+
+    With ``collapsed`` the per-finding detail is wrapped in a ``<details>``
+    block, so the posted comment shows only the heading and the severity
+    tally until the reader expands "Show Findings". The error / passed
+    messages are short and never collapsed.
+    """
     if result.error:
         return f"## PwnGuard Error\n\n```\n{result.error}\n```"
 
     if not result.findings:
         return "## PwnGuard Passed\n\nNo security issues found."
 
-    lines = ["## PwnGuard Findings\n"]
+    summary_line = _severity_summary_line(result.findings)
+    findings_md = "\n".join(
+        _finding_markdown(f) for f in _ordered_for_export(result.findings)
+    )
 
-    summary = result.summary
-    summary_parts = []
-    for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
-        if sev in summary:
-            summary_parts.append(f"**{summary[sev]}** {sev}")
-    lines.append(" | ".join(summary_parts))
-    lines.append("")
+    if collapsed:
+        return (
+            "## PwnGuard Findings\n\n"
+            f"{summary_line}\n"
+            "<details>\n<summary>Show Findings</summary>\n\n"
+            f"{findings_md}\n"
+            "</details>"
+        )
 
-    for f in _ordered_for_export(result.findings):
-        lines.append(_finding_markdown(f))
-
-    return "\n".join(lines)
+    return f"## PwnGuard Findings\n\n{summary_line}\n\n{findings_md}"
 
 
-def post_gitlab_comment(comment: str) -> bool:
-    """Post a comment to the GitLab MR via API."""
+def post_gitlab_comment(comment: str, *, as_thread: bool = False) -> bool:
+    """Post a comment to the GitLab MR via API.
+
+    ``as_thread`` posts a resolvable discussion (``/discussions``) instead
+    of a plain note (``/notes``); the thread must then be resolved before
+    the MR can merge when the project requires all threads resolved. Both
+    endpoints take ``{"body": ...}`` and return 201 on success.
+    """
     project_id = os.environ.get("CI_PROJECT_ID")
     mr_iid = os.environ.get("CI_MERGE_REQUEST_IID")
     token = os.environ.get("GITLAB_TOKEN") or os.environ.get("CI_JOB_TOKEN")
@@ -86,7 +99,11 @@ def post_gitlab_comment(comment: str) -> bool:
         print("Warning: GitLab CI environment variables not set, skipping MR comment")
         return False
 
-    url = f"{gitlab_url}/api/v4/projects/{project_id}/merge_requests/{mr_iid}/notes"
+    endpoint = "discussions" if as_thread else "notes"
+    url = (
+        f"{gitlab_url}/api/v4/projects/{project_id}"
+        f"/merge_requests/{mr_iid}/{endpoint}"
+    )
     payload = json.dumps({"body": comment}).encode()
 
     req = urllib.request.Request(

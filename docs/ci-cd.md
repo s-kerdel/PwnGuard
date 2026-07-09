@@ -101,6 +101,26 @@ scan:
 2. Just below it, disable **"Skipped pipelines are considered
    successful"**, so a scan that never runs can't count as a pass.
 
+## MR comment style
+
+`--mode ci --mr-diff` posts the findings back to the merge request. Two
+`gitlab:` keys in `pwnguard.yaml` control how:
+
+```yaml
+gitlab:
+  comment_as_thread: true   # default
+  comment_collapsed: true   # default
+```
+
+- **`comment_as_thread`** - `true` posts a **resolvable discussion thread**
+  (someone has to resolve it before merge when the project requires all
+  threads resolved); `false` posts a plain, non-resolvable note. A clean
+  pass or an error is always a plain note - it never opens a thread you'd
+  have to resolve to merge.
+- **`comment_collapsed`** - `true` wraps the finding detail in a folded
+  `<details>` block, leaving the heading and severity tally visible;
+  `false` posts the full detail inline.
+
 ## Log output: collapsible findings
 
 In a pipeline, each finding is a **collapsible log section**, folded by
