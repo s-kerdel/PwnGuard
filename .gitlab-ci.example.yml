@@ -14,6 +14,13 @@
 # The ANTHROPIC_API_KEY variable must be available on the MR's branch:
 # leave "Protect variable" UNCHECKED (masked is fine), otherwise a
 # feature-branch MR pipeline can't see it.
+#
+# allow_failure: false fails the pipeline when PwnGuard finds an issue,
+# but a failed pipeline does not block merging on its own. To enforce it:
+#   1. Settings > Merge requests > Merge checks: enable "Pipelines must
+#      succeed".
+#   2. Just below it, disable "Skipped pipelines are considered
+#      successful", so a scan that never runs can't count as a pass.
 
 stages:
   # ... your existing stages ...

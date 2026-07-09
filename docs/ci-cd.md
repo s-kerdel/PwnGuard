@@ -91,6 +91,16 @@ Add `ANTHROPIC_API_KEY` (and `GITLAB_TOKEN` for MR comments) as masked
 CI/CD variables. Leave them unprotected, or a feature-branch MR pipeline
 won't receive them.
 
+`allow_failure: false` makes a finding fail the pipeline. On its own,
+though, a failed pipeline does not stop anyone from merging - GitLab only
+enforces that once you enable a merge check. To block merges on a failed
+scan:
+
+1. Go to **Settings > Merge requests > Merge checks** and enable
+   **"Pipelines must succeed"**.
+2. Just below it, disable **"Skipped pipelines are considered
+   successful"**, so a scan that never runs can't count as a pass.
+
 ## Log output: collapsible findings
 
 In a pipeline, each finding is a **collapsible log section**, folded by
