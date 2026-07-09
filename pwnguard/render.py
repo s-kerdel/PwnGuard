@@ -8,7 +8,9 @@ emit raw ANSI; they call into ``ui.*`` from here.
 
 import contextlib
 import io
+import sys
 import textwrap
+import time
 from typing import Optional
 
 from pwnguard import runtime, ui
@@ -159,19 +161,20 @@ def _severity_marker(severity: str) -> str:
     return ui.severity_badge(severity, letter)
 
 
-def _print_legend() -> None:
+def _print_legend(indent: str = "") -> None:
     """Compact legend explaining the C/H/M/L/I/O letter badges.
 
     The `O` (observation) entry is only included when --show-observations
     is on, so users who haven't opted in don't see a legend item for
-    something they'll never produce.
+    something they'll never produce. ``indent`` left-pads the row so it can
+    line up with the finding rows (the sectioned CI layout indents both).
     """
     parts = []
     for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
         parts.append(f"{_severity_marker(sev)} {ui.dim(sev.lower())}")
     if runtime.show_observations:
         parts.append(f"{_severity_marker('OBSERVATION')} {ui.dim('observation')}")
-    print("  " + "  ".join(parts))
+    print(indent + "  ".join(parts))
 
 
 def _build_metadata(f: Finding) -> str:
@@ -556,17 +559,21 @@ def _render_finding_card(
     print(box_indent + bot)
 
 
-def _print_finding_block(f: Finding, diff_lines: dict) -> None:
+def _print_finding_block(
+    f: Finding, diff_lines: dict, outer_indent: str = "  ",
+) -> None:
     """Default layout: render the finding as a boxed card (or flat when
     ``_use_finding_card`` is False). Delegates to :func:`_render_finding_card`
     so the review TUI and the default output stay visually identical
-    apart from the cursor / checkbox nav prefix.
+    apart from the cursor / checkbox nav prefix. ``outer_indent`` is the
+    card's left margin (the sectioned CI layout tucks the body one column
+    left of the finding header).
     """
     _render_finding_card(
         f,
         diff_lines,
         width=ui.term_width(),
-        outer_indent="  ",
+        outer_indent=outer_indent,
     )
     print()
 
@@ -585,17 +592,33 @@ def _print_summary(result: AuditResult) -> None:
     print()
 
 
-def _print_footer(result: AuditResult, threshold: str) -> None:
-    """Result label (PASS/FAIL) + actionable next step."""
+def _print_footer(
+    result: AuditResult, threshold: str, ci: bool = False, report_only: bool = False,
+) -> None:
+    """Result label (PASS/FAIL) + actionable next step.
+
+    The ``git commit`` / ``PWNGUARD_SKIP`` hint is hook-specific; ``ci``
+    drops it, since there's no local commit to retry or bypass in a
+    pipeline (the pipeline gate is the exit code). ``report_only`` reframes
+    a block as advisory - the findings stand, but the run exits 0, so the
+    label must not read FAIL.
+    """
     if result.exceeds_threshold(threshold):
-        label = ui.bold(ui.red("FAIL"))
         threshold_rank = SEVERITY_ORDER.get(threshold, 3)
         n = sum(
             1 for f in result.blocking_findings
             if SEVERITY_ORDER.get(f.severity, 0) >= threshold_rank
         )
-        print(f"{label}  Fix the {n} issue{'s' if n != 1 else ''} above, then `{ui.bold('git commit')}`.")
-        print(f"      Bypass once: {ui.dim('PWNGUARD_SKIP=1 git commit')}")
+        issues = f"{n} issue{'s' if n != 1 else ''}"
+        if report_only:
+            label = ui.bold(ui.yellow("ADVISORY"))
+            print(f"{label}  {issues} found; not blocking (--report-only).")
+        elif ci:
+            print(f"{ui.bold(ui.red('FAIL'))}  Fix the {issues} above.")
+        else:
+            label = ui.bold(ui.red("FAIL"))
+            print(f"{label}  Fix the {issues} above, then `{ui.bold('git commit')}`.")
+            print(f"      Bypass once: {ui.dim('PWNGUARD_SKIP=1 git commit')}")
     else:
         label = ui.bold(ui.green("PASS"))
         print(f"{label}  No findings at or above {threshold} threshold.")
@@ -661,6 +684,91 @@ def _print_observations(observations: list) -> None:
                 print(f"{BODY_INDENT}{ui.dim(line)}")
 
 
+def _section_header(f: Finding) -> str:
+    """Styled one-line header for a collapsible CI section.
+
+    Shown as the fold row on GitLab/GitHub, so the collapsed log reads as
+    the findings index: severity badge, location, title, CWE. Single line
+    and self-resetting (each ui.* helper closes its own escape) because
+    GitHub drops the active ANSI style on a newline - the styling must not
+    straddle one. Uses plain CWE text rather than the OSC 8 hyperlink the
+    detail card carries; link escapes in a section-marker header don't
+    render reliably.
+    """
+    parts = [_severity_marker(f.severity)]
+    if f.file:
+        parts.append(ui.dim_cyan(f"{f.file}:{f.line}" if f.line else f.file))
+    parts.append(ui.bold(f.title))
+    if f.cwe:
+        parts.append(ui.dim(f.cwe))
+    return "  ".join(parts)
+
+
+def _section_start(platform: str, sid: str, header: str) -> None:
+    """Open a collapsible log section on the active CI platform.
+
+    GitLab uses ``section_start`` markers wrapped in ``\\e[0K`` erase-line
+    codes plus a unix timestamp, and ``[collapsed=true]`` to fold by
+    default. GitHub uses ``::group::`` workflow commands, which fold by
+    default already. Any other platform ("plain") prints nothing so the
+    finding renders without a wrapper.
+    """
+    if platform == "gitlab":
+        ts = int(time.time())
+        sys.stdout.write(
+            f"\x1b[0Ksection_start:{ts}:{sid}[collapsed=true]\r\x1b[0K{header}\n"
+        )
+    elif platform == "github":
+        print(f"::group::{header}")
+
+
+def _section_end(platform: str, sid: str) -> None:
+    """Close the section opened by :func:`_section_start`."""
+    if platform == "gitlab":
+        ts = int(time.time())
+        sys.stdout.write(f"\x1b[0Ksection_end:{ts}:{sid}\r\x1b[0K\n")
+    elif platform == "github":
+        print("::endgroup::")
+
+
+def _print_overview(result: AuditResult) -> None:
+    """Compact one-row-per-finding index, severity-ordered, above the cards.
+
+    Gives CI logs (which scroll) a scannable table at the top so the full
+    finding list is visible before the detailed cards - and before the
+    per-finding sections, which fold shut on GitLab/GitHub. Skipped for a
+    single finding, where the card below is already the whole story.
+    """
+    findings = _ordered_findings(result)
+    if len(findings) < 2:
+        return
+    width = ui.term_width()
+    locs = []
+    for f in findings:
+        loc = ""
+        if f.file:
+            loc = f"{f.file}:{f.line}" if f.line else f.file
+        locs.append(loc)
+    loc_w = min(40, max((len(loc) for loc in locs), default=0))
+
+    print(ui.dim(f"Findings ({len(findings)})"))
+    for f, loc in zip(findings, locs):
+        badge = _severity_marker(f.severity)
+        loc_cell = ui.dim_cyan(loc.ljust(loc_w)) if loc_w else ""
+        cwe = _render_cwe(f)
+        cwe_w = ui.visible_len(cwe)
+        # Fixed left columns: 2 indent + 3 badge + 1 + loc_w + 2 gap.
+        used = 2 + 3 + 1 + loc_w + 2
+        title_budget = max(10, width - used - (cwe_w + 2 if cwe else 0))
+        title = _truncate_visible(ui.bold(f.title), title_budget)
+        line = f"  {badge} {loc_cell}  {title}"
+        if cwe:
+            pad = max(1, width - ui.visible_len(line) - cwe_w)
+            line = line + (" " * pad) + cwe
+        print(line)
+    print()
+
+
 def print_terminal(
     result: AuditResult,
     threshold: str,
@@ -668,6 +776,8 @@ def print_terminal(
     *,
     files_scanned: int,
     quiet: bool = False,
+    ci: bool = False,
+    report_only: bool = False,
 ) -> None:
     """Render the audit result to the terminal in the grouped layout."""
     width = ui.term_width()
@@ -694,21 +804,44 @@ def print_terminal(
         return
 
     # Legend (only when there are findings; otherwise it's noise).
-    _print_legend()
+    platform = runtime.platform
+    sectioned = platform in ("gitlab", "github") and not quiet
+
+    # In the sectioned CI layout the legend and the finding rows share a
+    # one-space indent (the badge adds a second column); the card body
+    # tucks one column further left when a finding is expanded.
+    _print_legend(indent=" " if sectioned else "")
     print()
 
-    # Both layouts group by file and share the title-row format.
-    # --quiet collapses to that one row; default mode adds the code
-    # snippet, description, and fix beneath.
-    for filepath, findings in _findings_by_file(result):
-        print(_file_header(filepath, findings))
-        if quiet:
-            for f in findings:
-                _print_finding_title_row(f, width)
-            print()
-        else:
-            for f in findings:
-                _print_finding_block(f, diff_lines)
+    if sectioned:
+        # One collapsible section per finding, severity-ordered. The
+        # section header is the styled findings row, so the folded log
+        # already reads as the overview - expanding a header reveals that
+        # finding's card. No separate index table and no file grouping:
+        # the collapsed headers are the list.
+        for i, f in enumerate(_ordered_findings(result)):
+            sid = f"pwnguard_{i}"
+            # Header row is indented by the leading " " (plus the badge's
+            # own space); the card body sits one column to its left.
+            _section_start(platform, sid, " " + _section_header(f))
+            _print_finding_block(f, diff_lines, outer_indent=" ")
+            _section_end(platform, sid)
+    else:
+        # Plain terminal / --quiet: no fold mechanism, so print the
+        # findings index above the details (skipped in --quiet, where the
+        # per-file title rows already are the compact list) and group the
+        # cards by file.
+        if not quiet:
+            _print_overview(result)
+        for filepath, findings in _findings_by_file(result):
+            print(_file_header(filepath, findings))
+            if quiet:
+                for f in findings:
+                    _print_finding_title_row(f, width)
+                print()
+            else:
+                for f in findings:
+                    _print_finding_block(f, diff_lines)
 
     _print_summary(result)
     _print_observations(result.observations)
@@ -717,4 +850,4 @@ def print_terminal(
     # when there were no observations (summary already left a blank).
     if result.observations:
         print()
-    _print_footer(result, threshold)
+    _print_footer(result, threshold, ci=ci, report_only=report_only)

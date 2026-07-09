@@ -5,6 +5,31 @@
 #
 # For MR comments, set GITLAB_TOKEN (personal access token, api scope)
 # in Settings > CI/CD > Variables (masked, protected)
+#
+# PwnGuard shells out to `git` to build the MR diff, so the job image
+# must have git installed. The `python:3.12-slim` image does NOT ship
+# git - either switch to the full `python:3.12` image (git included) or
+# apt-get install it in before_script (shown in Option B below).
+#
+# The ANTHROPIC_API_KEY variable must be available on the MR's branch:
+# leave "Protect variable" UNCHECKED (masked is fine), otherwise a
+# feature-branch MR pipeline can't see it.
+#
+# allow_failure toggles how findings affect the merge:
+#   false = blocking gate. A finding fails the job, which fails the
+#           pipeline, which blocks the merge (with "Pipelines must
+#           succeed" enabled, below).
+#   true  = advisory. PwnGuard still runs and posts its findings (job log
+#           + MR comment) and the job shows a warning, but the pipeline
+#           stays green, so the merge is NOT blocked and "Pipelines must
+#           succeed" keeps gating your other jobs. Ideal for trialing
+#           PwnGuard on a project before turning it into a hard gate.
+#
+# For the blocking mode to actually block the merge:
+#   1. Settings > Merge requests > Merge checks: enable "Pipelines must
+#      succeed".
+#   2. Just below it, disable "Skipped pipelines are considered
+#      successful", so a scan that never runs can't count as a pass.
 
 stages:
   # ... your existing stages ...
@@ -23,12 +48,12 @@ pwnguard:
     - ollama list || echo "Warning: Ollama not available"
   script:
     - pwnguard --mode ci --mr-diff --backend ollama
-  allow_failure: false
+  allow_failure: false   # true = advisory (runs + comments, never blocks)
 
 # --- Option B: Claude API (if org has API access) ---
 # pwnguard:
 #   stage: security
-#   image: python:3.12-slim
+#   image: python:3.12-slim   # slim has no git; installed in before_script
 #   rules:
 #     - if: $CI_MERGE_REQUEST_IID
 #   variables:
@@ -38,7 +63,10 @@ pwnguard:
 #     paths:
 #       - .pip-cache/
 #   before_script:
+#     # git is required to build the MR diff; slim doesn't include it.
+#     # (Or drop these two lines and use image: python:3.12 instead.)
+#     - apt-get update && apt-get install -y --no-install-recommends git
 #     - pip install "pwnguard[claude-api]" --quiet
 #   script:
 #     - pwnguard --mode ci --mr-diff --backend claude-api
-#   allow_failure: false
+#   allow_failure: false   # true = advisory (runs + comments, never blocks)

@@ -1,6 +1,6 @@
 # PwnGuard
 
-> **Status: Proof of Concept (`v0.2.6`).**
+> **Status: Proof of Concept (`v0.2.7`).**
 > PwnGuard is an open-source security tool by Shiva Kerdel (Power to Logic).
 > It flags risky code when committing your work, so issues surface during
 > development instead of in production. Proof of concept: flags and config
@@ -336,6 +336,7 @@ Every flag accepted by `pwnguard`. Default values come from
 | `--no-color` | off | Disable ANSI color and OSC 8 hyperlinks. Also auto-disabled when stdout is not a TTY or when `NO_COLOR` is set. |
 | `--color` | off | Force color and hyperlinks on even when stdout is not a TTY - needed when a git hook manager or `composer run-script` captures output through a pipe. Mirrors the `FORCE_COLOR` env var; `--no-color` / `NO_COLOR` win if both are set. In this case the terminal width is read from `/dev/tty` so boxes still fill the screen. |
 | `--code-preview {auto,on,off}` | `auto` | Show the affected-code block + `Example:` fix snippet. `auto` = on for claude backends, off for ollama (smaller models give imprecise line numbers and skip fix examples). |
+| `--platform {auto,plain,gitlab,github}` | `auto` | CI log rendering. `gitlab` / `github` fold each finding into a collapsible, collapsed-by-default log section. `auto` detects `GITLAB_CI` / `GITHUB_ACTIONS` from the environment (and inside those, also forces color on and widens output to 120 columns; set `COLUMNS` to change it), else `plain`. See [docs/ci-cd.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/ci-cd.md). |
 | `--report <PATH>` | (none) | Write the findings as a Markdown report to `<PATH>`. |
 | `--debug` | off | Stream the model's output live to stderr (ollama + openai-compat backends). During prompt processing a "Waiting for response..." / "Model is thinking..." spinner shows that the server is active; once tokens start arriving the spinner exits and the stream takes over. Prints per-request stats at the end (token count, tokens-per-second, stop reason). Useful when scans return empty or stop unexpectedly. |
 | `--show-observations` | off | Also surface a short list (max 5) of neutral observations about defensive patterns the model noticed in the diff (e.g. "parameterised query used", "output escaped"). Opt-in and additive: never replaces findings, never claims code is secure. Rendered dim and clearly labelled "informational only" so it can't compete with HIGH/CRITICAL signal. Adds a small number of prompt + output tokens. |
@@ -345,6 +346,7 @@ Every flag accepted by `pwnguard`. Default values come from
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--threshold {CRITICAL,HIGH,MEDIUM,LOW,INFO}` | from config (`HIGH`) | Severity threshold that blocks (exit 1). |
+| `--report-only` | off | Advisory mode: still report findings (log + MR comment) but exit 0 even above the threshold, so a CI job passes and never blocks the merge. A genuine run error still exits 2. Drop it to enforce. |
 | `--dry-run` | off | Show what would be sent to the AI (files, diff size, token estimate) without making the API call. |
 | `--review` | off | After the scan, drop into an interactive TUI to step through findings. See [docs/review-tui.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/review-tui.md). When a hook scan blocks a commit in an interactive terminal, PwnGuard prints a tip to re-run with `--review --cached`. |
 | `--cached` | off | Reuse the most recent scan of the *identical* staged diff instead of re-running the AI - pairs with the `--review` re-run after a hook scan. Content-keyed on diff + backend + model + pwnguard version, stored in `.git/pwnguard-scan-cache.json`; any change misses and re-scans. Falls back to a fresh scan on any miss, errored scans are never cached, and the security gate (a bare hook run) never reads it. Staged-diff path only. |
@@ -436,6 +438,16 @@ Security guards: the URL scheme is restricted to `http` / `https` (no
 `file://` / `ftp://`); HTTP redirects are refused so the Bearer token
 can never be forwarded across hosts; the destination host is printed
 on every run so a stealth yaml edit is visible.
+
+### `gitlab:` (MR comment posting)
+
+How findings are posted back to the merge request on `--mode ci --mr-diff`
+(needs `GITLAB_TOKEN` or `CI_JOB_TOKEN`).
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `comment_as_thread` | `true` | `true` posts a resolvable discussion thread (must be resolved before merge when the project requires resolved threads); `false` posts a plain, non-resolvable note. A clean pass / error is always a plain note. |
+| `comment_collapsed` | `true` | `true` wraps the finding detail in a folded `<details>` block, keeping the heading and severity tally visible; `false` posts the full detail inline. |
 
 ### Local override (`pwnguard.local.yaml`)
 
@@ -609,9 +621,24 @@ Two options:
 
 - Add `ANTHROPIC_API_KEY` to CI/CD Variables (masked, protected)
 
-Both block merge on HIGH/CRITICAL findings and post results as MR
-comments. For comment posting, set `GITLAB_TOKEN` (or use the
-auto-provided `CI_JOB_TOKEN` for project-internal access).
+Both fail the pipeline on HIGH/CRITICAL findings and post results as MR
+comments. A failed pipeline only blocks the merge once you enable
+**Settings > Merge requests > Merge checks > "Pipelines must succeed"**.
+For comment posting, set `GITLAB_TOKEN` (or use the auto-provided
+`CI_JOB_TOKEN` for project-internal access).
+
+By default PwnGuard posts findings as **resolvable discussion threads**
+(`gitlab.comment_as_thread`). To make those threads a merge blocker of
+their own - each one must be resolved before the MR can merge - also
+enable **Settings > Merge requests > Merge checks > "All threads must be
+resolved"**. Leave it off (or set `comment_as_thread: false`) to keep the
+comments purely informational.
+
+Inside a pipeline PwnGuard auto-detects GitLab/GitHub and folds each
+finding into a collapsible log section, forces color on, and widens the
+report to 120 columns. The job image also needs `git` (the `slim` Python
+images don't ship it). See
+[docs/ci-cd.md](https://github.com/s-kerdel/PwnGuard/blob/main/docs/ci-cd.md).
 
 For GitHub Actions, a generic example, and how to rehearse the gate
 locally before configuring any pipeline, see
@@ -622,10 +649,13 @@ locally before configuring any pipeline, see
 | Layer | Threshold | Bypassable |
 |-------|-----------|------------|
 | Pre-commit (local) | HIGH | Yes (`--no-verify` or `PWNGUARD_SKIP=1`) |
-| GitLab CI (pipeline) | HIGH | No |
+| GitLab CI (pipeline) | HIGH | Depends on `allow_failure` |
 
-Both enforce the same threshold. Local is fast feedback. CI is the
-hard gate.
+Both enforce the same threshold. Local is fast feedback. In CI, the
+`pwnguard` job's `allow_failure` picks the mode: `false` (blocking) makes
+a finding block the merge once **"Pipelines must succeed"** is enabled;
+`true` (advisory) still runs and comments but never blocks - good for
+trialing PwnGuard on a project. See the GitLab CI section for both.
 
 ## Limitations
 

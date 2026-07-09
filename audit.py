@@ -54,7 +54,9 @@ from pwnguard.fetchers import (  # noqa: F401
 # Rendering helpers tested directly -----------------------------------------
 from pwnguard.render import (  # noqa: F401
     _print_finding_block,
+    _section_header,
     _truncate_visible,
+    print_terminal,
 )
 from pwnguard.review import _render_review_row  # noqa: F401
 

@@ -83,11 +83,116 @@ Paste the stage from [`.gitlab-ci.example.yml`](../.gitlab-ci.example.yml)
 `pwnguard --mode ci --mr-diff` and posts findings as MR comments when
 `GITLAB_TOKEN` is set.
 
+The job image needs `git` (PwnGuard shells out to it to build the MR
+diff). `python:3.12-slim` doesn't include it, so use the full
+`python:3.12` image or `apt-get install -y git` in `before_script`.
+
+Add `ANTHROPIC_API_KEY` (and `GITLAB_TOKEN` for MR comments) as masked
+CI/CD variables. Leave them unprotected, or a feature-branch MR pipeline
+won't receive them.
+
+### Blocking vs advisory
+
+`allow_failure` on the `pwnguard` job chooses how findings affect the
+merge:
+
+- **`allow_failure: false` (blocking gate)** - a finding fails the job,
+  which fails the pipeline. To turn a failed pipeline into an actual merge
+  block, also enable the merge check:
+  1. **Settings > Merge requests > Merge checks** - enable **"Pipelines
+     must succeed"**.
+  2. Just below it, disable **"Skipped pipelines are considered
+     successful"**, so a scan that never runs can't count as a pass.
+- **`allow_failure: true` (advisory)** - PwnGuard still runs and posts its
+  findings (job log + MR comment), and the job shows a **warning**, but the
+  pipeline stays green so the merge is **not** blocked. "Pipelines must
+  succeed" keeps gating your *other* jobs. This is the mode for trialing
+  PwnGuard on a project - watch how it performs without it blocking merges,
+  then flip to `allow_failure: false` when you're ready to enforce.
+
+Note the job's orange **warning** icon under `allow_failure: true` is not
+the pipeline status: the pipeline still reads **passed (with warnings)**,
+which is what keeps the merge unblocked. If an advisory run seems to block,
+check that `allow_failure: true` is on the `pwnguard` job specifically and
+that no *other* job is failing.
+
+### `--report-only` (advisory without `allow_failure`)
+
+If `allow_failure: true` isn't behaving, or you'd rather the job be a plain
+green pass (no warning icon) and not depend on a GitLab setting, add
+`--report-only` to the command:
+
+```yaml
+script:
+  - pwnguard --mode ci --mr-diff --backend claude-api --report-only
+```
+
+PwnGuard still prints findings and posts the MR comment, but **exits 0**
+even when findings exceed the threshold - so the job succeeds and never
+blocks. The footer reads `ADVISORY` instead of `FAIL`. A genuine run error
+(bad config, unreachable backend) still exits 2, so a broken scan doesn't
+pass silently. Drop the flag to go back to blocking.
+
+## MR comment style
+
+`--mode ci --mr-diff` posts the findings back to the merge request. Two
+`gitlab:` keys in `pwnguard.yaml` control how:
+
+```yaml
+gitlab:
+  comment_as_thread: true   # default
+  comment_collapsed: true   # default
+```
+
+- **`comment_as_thread`** - `true` posts a **resolvable discussion thread**
+  (someone has to resolve it before merge when the project requires all
+  threads resolved); `false` posts a plain, non-resolvable note. A clean
+  pass or an error is always a plain note - it never opens a thread you'd
+  have to resolve to merge.
+- **`comment_collapsed`** - `true` wraps the finding detail in a folded
+  `<details>` block, leaving the heading and severity tally visible;
+  `false` posts the full detail inline.
+
+For the threads to actually gate the merge, enable **Settings > Merge
+requests > Merge checks > "All threads must be resolved"** - then each
+thread PwnGuard opens must be resolved before the MR can merge. Without
+it, the threads are informational and don't block.
+
+## Log output: collapsible findings
+
+In a pipeline, each finding is a **collapsible log section**, folded by
+default, whose header is that finding's row (severity, location, title,
+CWE). Collapsed, the log reads as a severity-ordered index; expand a
+header to reveal that finding's details. In a plain terminal, where the
+log can't fold, a **findings overview** table prints above the detailed
+cards instead.
+
+Inside GitLab/GitHub, PwnGuard forces ANSI color on (their logs render
+it even though stdout is a pipe) and widens the report to 120 columns.
+Set `COLUMNS` in the job to use a different width; `NO_COLOR=1` or
+`--no-color` turns color off. CWE and file links render as plain styled
+text there, since those log viewers don't support terminal hyperlinks.
+
+This is driven by `--platform`, which **auto-detects** the CI from its own
+environment variables and needs no wiring:
+
+| `--platform` | Behaviour |
+|--------------|-----------|
+| `auto` (default) | `gitlab` when `GITLAB_CI` is set, `github` when `GITHUB_ACTIONS` is set, else `plain` |
+| `gitlab` | GitLab `section_start`/`section_end` collapsible sections |
+| `github` | GitHub Actions `::group::` log groups |
+| `plain` | overview only, no section markers (the right choice for a local terminal) |
+
+The overview table prints on every platform, including locally. Only the
+section markers are platform-specific; pass `--platform plain` to force them
+off, or name a platform explicitly if auto-detection guesses wrong.
+
 ## Suppress a false positive
 
-Do **not** reach for `allow_failure: true` or `--no-verify`: those drop
-the gate for everything. Add a `pwnguard:ignore` comment in the code under
-review instead (see the README's "Suppress a false positive" section). It
+Do **not** get past a false positive by loosening the gate for everyone
+(`--no-verify` locally, or raising `--threshold`). Add a `pwnguard:ignore`
+comment in the code under review instead (see the README's "Suppress a
+false positive" section). It
 travels in the PR/MR diff, so the next run re-scans and that one finding
 no longer blocks while the rest still count. The job log prints
 `N finding(s) suppressed inline` and `--json` includes a `suppressed` count.

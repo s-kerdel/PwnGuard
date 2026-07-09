@@ -105,6 +105,26 @@ class _WideHelpFormatter(argparse.RawDescriptionHelpFormatter):
         super().__init__(prog, max_help_position=32, **kwargs)
 
 
+# Config block holding the model string for each model-driven backend.
+# claude-code has none (it drives the `claude` CLI's own model).
+_BACKEND_MODEL_BLOCK = {
+    "claude-api": "claude_api",
+    "ollama": "ollama",
+    "openai-compat": "openai",
+}
+
+
+def _ci_run_banner(backend: str, config: dict) -> str:
+    """One-line ``PwnGuard vX  ·  backend  ·  model`` banner for CI logs, so
+    the pipeline output states which version and model ran (whether it's
+    current, and what review quality to expect)."""
+    block = _BACKEND_MODEL_BLOCK.get(backend)
+    model = config.get(block, {}).get("model") if block else None
+    head = f"{ui.bold('PwnGuard')} {ui.dim('v' + __version__)}"
+    sep = f"  {ui.dim('·')}  "
+    return f"{head}{sep}{backend}{sep}{model}" if model else f"{head}{sep}{backend}"
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="pwnguard",
@@ -202,6 +222,17 @@ def main():
         "--threshold",
         choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
         help="Override severity threshold from config",
+    )
+    policy_group.add_argument(
+        "--report-only",
+        action="store_true",
+        help=(
+            "Advisory mode: still report findings (log + MR comment) but "
+            "exit 0 even when they exceed the threshold, so the CI job "
+            "passes and never blocks the merge. A genuine run error still "
+            "exits 2. Use it to trial PwnGuard on a project without gating; "
+            "drop it (or use allow_failure: false) to enforce."
+        ),
     )
     policy_group.add_argument(
         "--dry-run",
@@ -320,6 +351,18 @@ def main():
             "supported by every openai-compat server. 'raw' lets the "
             "model emit freely and relies on PwnGuard's parse fallbacks. "
             "Default: json for ollama, raw for openai-compat."
+        ),
+    )
+    advanced_group.add_argument(
+        "--platform",
+        choices=["auto", "plain", "gitlab", "github"],
+        default="auto",
+        help=(
+            "CI platform for log rendering. 'gitlab'/'github' wrap each "
+            "finding in a collapsible log section (folded by default) and "
+            "print a findings overview table above the details. 'plain' "
+            "emits neither. 'auto' (default) detects GITLAB_CI / "
+            "GITHUB_ACTIONS from the environment, falling back to plain."
         ),
     )
     advanced_group.add_argument(
@@ -464,6 +507,29 @@ def main():
     # stays silent on success and findings never get diluted.
     runtime.set_show_observations(args.show_observations)
 
+    # CI platform for log rendering. "auto" sniffs the CI's own env vars
+    # (GITLAB_CI / GITHUB_ACTIONS) so the collapsible-section output turns
+    # on inside a pipeline without the user wiring a flag, and stays off
+    # (plain) in a local terminal where the section markers are noise.
+    platform = args.platform
+    if platform == "auto":
+        if os.environ.get("GITLAB_CI"):
+            platform = "gitlab"
+        elif os.environ.get("GITHUB_ACTIONS"):
+            platform = "github"
+        else:
+            platform = "plain"
+    runtime.set_platform(platform)
+
+    # CI log panes are far wider than the 80-column fallback used when
+    # stdout is a pipe with no detectable terminal size. Widen the default
+    # for GitLab/GitHub; COLUMNS (or a real terminal) still overrides.
+    # Their log viewers also can't render OSC 8, so drop hyperlinks - the
+    # escape would show as literal URL text and overrun the card border.
+    if platform in ("gitlab", "github"):
+        ui.set_default_width(120)
+        ui.set_hyperlinks(False)
+
     # Monitor mode: dashboard over the configured monitor.repos[]. Opens
     # the TUI immediately on cached state; [r] inside the TUI refreshes.
     # Short-circuits the normal scan path entirely - no diff source, no
@@ -498,6 +564,14 @@ def main():
         )
         print(f"Threshold: {threshold}")
         sys.exit(0)
+
+    # In CI, state version + backend/model up front (before the scan, so
+    # it shows even if the backend later errors). flush=True keeps it above
+    # the "Scanning with ..." spinner, which writes to stderr and would
+    # otherwise beat the block-buffered stdout banner in the CI log.
+    # Skipped for --json so stdout stays pure JSON.
+    if args.mode == "ci" and not args.json:
+        print(_ci_run_banner(backend, config), flush=True)
 
     # Normal scan path.
     result, diff, diff_lines, files_scanned = run_scan(
@@ -558,11 +632,19 @@ def main():
         # Terminal output for CI logs
         print_terminal(
             result, threshold, diff_lines,
-            files_scanned=files_scanned, quiet=args.quiet,
+            files_scanned=files_scanned, quiet=args.quiet, ci=True,
+            report_only=args.report_only,
         )
-        # Post to GitLab MR
-        comment = format_gitlab_comment(result)
-        post_gitlab_comment(comment)
+        # Post to GitLab MR. Defaults: resolvable thread + collapsed body.
+        gitlab_cfg = config.get("gitlab", {})
+        collapsed = gitlab_cfg.get("comment_collapsed", True)
+        # Only open a resolvable thread when there's something to act on; a
+        # "passed" / error note shouldn't have to be resolved to merge.
+        as_thread = bool(gitlab_cfg.get("comment_as_thread", True)) and bool(
+            result.findings
+        )
+        comment = format_gitlab_comment(result, collapsed=collapsed)
+        post_gitlab_comment(comment, as_thread=as_thread)
     else:
         print_terminal(
             result, threshold, diff_lines,
@@ -584,9 +666,11 @@ def main():
     if args.report:
         write_report(result, args.report)
 
-    # Exit code
+    # Exit code. --report-only downgrades a findings block (1) to a pass
+    # (0) so the CI job stays green; a genuine run error (2) still fails so
+    # a broken scan isn't silently green.
     if result.error:
         sys.exit(2)
-    if result.exceeds_threshold(threshold):
+    if result.exceeds_threshold(threshold) and not args.report_only:
         sys.exit(1)
     sys.exit(0)
