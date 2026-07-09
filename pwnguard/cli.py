@@ -224,6 +224,17 @@ def main():
         help="Override severity threshold from config",
     )
     policy_group.add_argument(
+        "--report-only",
+        action="store_true",
+        help=(
+            "Advisory mode: still report findings (log + MR comment) but "
+            "exit 0 even when they exceed the threshold, so the CI job "
+            "passes and never blocks the merge. A genuine run error still "
+            "exits 2. Use it to trial PwnGuard on a project without gating; "
+            "drop it (or use allow_failure: false) to enforce."
+        ),
+    )
+    policy_group.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be sent to AI without sending",
@@ -555,10 +566,12 @@ def main():
         sys.exit(0)
 
     # In CI, state version + backend/model up front (before the scan, so
-    # it shows even if the backend later errors). Skipped for --json so
-    # stdout stays pure JSON.
+    # it shows even if the backend later errors). flush=True keeps it above
+    # the "Scanning with ..." spinner, which writes to stderr and would
+    # otherwise beat the block-buffered stdout banner in the CI log.
+    # Skipped for --json so stdout stays pure JSON.
     if args.mode == "ci" and not args.json:
-        print(_ci_run_banner(backend, config))
+        print(_ci_run_banner(backend, config), flush=True)
 
     # Normal scan path.
     result, diff, diff_lines, files_scanned = run_scan(
@@ -620,6 +633,7 @@ def main():
         print_terminal(
             result, threshold, diff_lines,
             files_scanned=files_scanned, quiet=args.quiet, ci=True,
+            report_only=args.report_only,
         )
         # Post to GitLab MR. Defaults: resolvable thread + collapsed body.
         gitlab_cfg = config.get("gitlab", {})
@@ -652,9 +666,11 @@ def main():
     if args.report:
         write_report(result, args.report)
 
-    # Exit code
+    # Exit code. --report-only downgrades a findings block (1) to a pass
+    # (0) so the CI job stays green; a genuine run error (2) still fails so
+    # a broken scan isn't silently green.
     if result.error:
         sys.exit(2)
-    if result.exceeds_threshold(threshold):
+    if result.exceeds_threshold(threshold) and not args.report_only:
         sys.exit(1)
     sys.exit(0)

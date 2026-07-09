@@ -225,6 +225,39 @@ def test_ci_banner_reads_configured_model():
     assert "qwen2.5-coder:14b" in b
 
 
+# ---------------------------------------------------------------------------
+# Footer: CI drops the hook bypass hint; --report-only reads as advisory
+# ---------------------------------------------------------------------------
+
+def _footer(**kw):
+    from pwnguard.render import _print_footer
+    r = _result([_finding("CRITICAL", "x", 1, "CWE-78")])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _print_footer(r, "HIGH", **kw)
+    return _strip(buf.getvalue())
+
+
+def test_footer_hook_shows_bypass_hint():
+    out = _footer()
+    assert "FAIL" in out
+    assert "PWNGUARD_SKIP=1" in out
+
+
+def test_footer_ci_drops_bypass_hint():
+    out = _footer(ci=True)
+    assert "FAIL" in out
+    assert "PWNGUARD_SKIP" not in out
+    assert "git commit" not in out
+
+
+def test_footer_report_only_is_advisory_not_fail():
+    out = _footer(ci=True, report_only=True)
+    assert "ADVISORY" in out
+    assert "FAIL" not in out
+    assert "not blocking" in out
+
+
 def test_default_width_used_when_size_undetectable(monkeypatch):
     import os as _os
     # Simulate a pipe with no terminal and no /dev/tty.

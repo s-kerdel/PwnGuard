@@ -15,8 +15,17 @@
 # leave "Protect variable" UNCHECKED (masked is fine), otherwise a
 # feature-branch MR pipeline can't see it.
 #
-# allow_failure: false fails the pipeline when PwnGuard finds an issue,
-# but a failed pipeline does not block merging on its own. To enforce it:
+# allow_failure toggles how findings affect the merge:
+#   false = blocking gate. A finding fails the job, which fails the
+#           pipeline, which blocks the merge (with "Pipelines must
+#           succeed" enabled, below).
+#   true  = advisory. PwnGuard still runs and posts its findings (job log
+#           + MR comment) and the job shows a warning, but the pipeline
+#           stays green, so the merge is NOT blocked and "Pipelines must
+#           succeed" keeps gating your other jobs. Ideal for trialing
+#           PwnGuard on a project before turning it into a hard gate.
+#
+# For the blocking mode to actually block the merge:
 #   1. Settings > Merge requests > Merge checks: enable "Pipelines must
 #      succeed".
 #   2. Just below it, disable "Skipped pipelines are considered
@@ -39,7 +48,7 @@ pwnguard:
     - ollama list || echo "Warning: Ollama not available"
   script:
     - pwnguard --mode ci --mr-diff --backend ollama
-  allow_failure: false
+  allow_failure: false   # true = advisory (runs + comments, never blocks)
 
 # --- Option B: Claude API (if org has API access) ---
 # pwnguard:
@@ -60,4 +69,4 @@ pwnguard:
 #     - pip install "pwnguard[claude-api]" --quiet
 #   script:
 #     - pwnguard --mode ci --mr-diff --backend claude-api
-#   allow_failure: false
+#   allow_failure: false   # true = advisory (runs + comments, never blocks)

@@ -592,24 +592,31 @@ def _print_summary(result: AuditResult) -> None:
     print()
 
 
-def _print_footer(result: AuditResult, threshold: str, ci: bool = False) -> None:
+def _print_footer(
+    result: AuditResult, threshold: str, ci: bool = False, report_only: bool = False,
+) -> None:
     """Result label (PASS/FAIL) + actionable next step.
 
     The ``git commit`` / ``PWNGUARD_SKIP`` hint is hook-specific; ``ci``
     drops it, since there's no local commit to retry or bypass in a
-    pipeline (the pipeline gate is the exit code).
+    pipeline (the pipeline gate is the exit code). ``report_only`` reframes
+    a block as advisory - the findings stand, but the run exits 0, so the
+    label must not read FAIL.
     """
     if result.exceeds_threshold(threshold):
-        label = ui.bold(ui.red("FAIL"))
         threshold_rank = SEVERITY_ORDER.get(threshold, 3)
         n = sum(
             1 for f in result.blocking_findings
             if SEVERITY_ORDER.get(f.severity, 0) >= threshold_rank
         )
         issues = f"{n} issue{'s' if n != 1 else ''}"
-        if ci:
-            print(f"{label}  Fix the {issues} above.")
+        if report_only:
+            label = ui.bold(ui.yellow("ADVISORY"))
+            print(f"{label}  {issues} found; not blocking (--report-only).")
+        elif ci:
+            print(f"{ui.bold(ui.red('FAIL'))}  Fix the {issues} above.")
         else:
+            label = ui.bold(ui.red("FAIL"))
             print(f"{label}  Fix the {issues} above, then `{ui.bold('git commit')}`.")
             print(f"      Bypass once: {ui.dim('PWNGUARD_SKIP=1 git commit')}")
     else:
@@ -770,6 +777,7 @@ def print_terminal(
     files_scanned: int,
     quiet: bool = False,
     ci: bool = False,
+    report_only: bool = False,
 ) -> None:
     """Render the audit result to the terminal in the grouped layout."""
     width = ui.term_width()
@@ -842,4 +850,4 @@ def print_terminal(
     # when there were no observations (summary already left a blank).
     if result.observations:
         print()
-    _print_footer(result, threshold, ci=ci)
+    _print_footer(result, threshold, ci=ci, report_only=report_only)

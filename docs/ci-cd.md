@@ -91,15 +91,47 @@ Add `ANTHROPIC_API_KEY` (and `GITLAB_TOKEN` for MR comments) as masked
 CI/CD variables. Leave them unprotected, or a feature-branch MR pipeline
 won't receive them.
 
-`allow_failure: false` makes a finding fail the pipeline. On its own,
-though, a failed pipeline does not stop anyone from merging - GitLab only
-enforces that once you enable a merge check. To block merges on a failed
-scan:
+### Blocking vs advisory
 
-1. Go to **Settings > Merge requests > Merge checks** and enable
-   **"Pipelines must succeed"**.
-2. Just below it, disable **"Skipped pipelines are considered
-   successful"**, so a scan that never runs can't count as a pass.
+`allow_failure` on the `pwnguard` job chooses how findings affect the
+merge:
+
+- **`allow_failure: false` (blocking gate)** - a finding fails the job,
+  which fails the pipeline. To turn a failed pipeline into an actual merge
+  block, also enable the merge check:
+  1. **Settings > Merge requests > Merge checks** - enable **"Pipelines
+     must succeed"**.
+  2. Just below it, disable **"Skipped pipelines are considered
+     successful"**, so a scan that never runs can't count as a pass.
+- **`allow_failure: true` (advisory)** - PwnGuard still runs and posts its
+  findings (job log + MR comment), and the job shows a **warning**, but the
+  pipeline stays green so the merge is **not** blocked. "Pipelines must
+  succeed" keeps gating your *other* jobs. This is the mode for trialing
+  PwnGuard on a project - watch how it performs without it blocking merges,
+  then flip to `allow_failure: false` when you're ready to enforce.
+
+Note the job's orange **warning** icon under `allow_failure: true` is not
+the pipeline status: the pipeline still reads **passed (with warnings)**,
+which is what keeps the merge unblocked. If an advisory run seems to block,
+check that `allow_failure: true` is on the `pwnguard` job specifically and
+that no *other* job is failing.
+
+### `--report-only` (advisory without `allow_failure`)
+
+If `allow_failure: true` isn't behaving, or you'd rather the job be a plain
+green pass (no warning icon) and not depend on a GitLab setting, add
+`--report-only` to the command:
+
+```yaml
+script:
+  - pwnguard --mode ci --mr-diff --backend claude-api --report-only
+```
+
+PwnGuard still prints findings and posts the MR comment, but **exits 0**
+even when findings exceed the threshold - so the job succeeds and never
+blocks. The footer reads `ADVISORY` instead of `FAIL`. A genuine run error
+(bad config, unreachable backend) still exits 2, so a broken scan doesn't
+pass silently. Drop the flag to go back to blocking.
 
 ## MR comment style
 
@@ -120,6 +152,11 @@ gitlab:
 - **`comment_collapsed`** - `true` wraps the finding detail in a folded
   `<details>` block, leaving the heading and severity tally visible;
   `false` posts the full detail inline.
+
+For the threads to actually gate the merge, enable **Settings > Merge
+requests > Merge checks > "All threads must be resolved"** - then each
+thread PwnGuard opens must be resolved before the MR can merge. Without
+it, the threads are informational and don't block.
 
 ## Log output: collapsible findings
 
