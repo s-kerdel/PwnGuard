@@ -5,6 +5,15 @@
 #
 # For MR comments, set GITLAB_TOKEN (personal access token, api scope)
 # in Settings > CI/CD > Variables (masked, protected)
+#
+# PwnGuard shells out to `git` to build the MR diff, so the job image
+# must have git installed. The `python:3.12-slim` image does NOT ship
+# git - either switch to the full `python:3.12` image (git included) or
+# apt-get install it in before_script (shown in Option B below).
+#
+# The ANTHROPIC_API_KEY variable must be available on the MR's branch:
+# leave "Protect variable" UNCHECKED (masked is fine), otherwise a
+# feature-branch MR pipeline can't see it.
 
 stages:
   # ... your existing stages ...
@@ -28,7 +37,7 @@ pwnguard:
 # --- Option B: Claude API (if org has API access) ---
 # pwnguard:
 #   stage: security
-#   image: python:3.12-slim
+#   image: python:3.12-slim   # slim has no git; installed in before_script
 #   rules:
 #     - if: $CI_MERGE_REQUEST_IID
 #   variables:
@@ -38,6 +47,9 @@ pwnguard:
 #     paths:
 #       - .pip-cache/
 #   before_script:
+#     # git is required to build the MR diff; slim doesn't include it.
+#     # (Or drop these two lines and use image: python:3.12 instead.)
+#     - apt-get update && apt-get install -y --no-install-recommends git
 #     - pip install "pwnguard[claude-api]" --quiet
 #   script:
 #     - pwnguard --mode ci --mr-diff --backend claude-api

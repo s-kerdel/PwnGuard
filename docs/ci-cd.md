@@ -83,6 +83,35 @@ Paste the stage from [`.gitlab-ci.example.yml`](../.gitlab-ci.example.yml)
 `pwnguard --mode ci --mr-diff` and posts findings as MR comments when
 `GITLAB_TOKEN` is set.
 
+The job image needs `git` (PwnGuard shells out to it to build the MR
+diff). `python:3.12-slim` doesn't include it, so use the full
+`python:3.12` image or `apt-get install -y git` in `before_script`.
+
+Add `ANTHROPIC_API_KEY` (and `GITLAB_TOKEN` for MR comments) as masked
+CI/CD variables. Leave them unprotected, or a feature-branch MR pipeline
+won't receive them.
+
+## Log output: overview + collapsible findings
+
+In a pipeline, PwnGuard prints a **findings overview** (one severity-ordered
+row per finding) above the detailed cards, then wraps each detailed card in
+a **collapsible log section** that is folded by default - so the log opens on
+a scannable index and you expand only the finding you care about.
+
+This is driven by `--platform`, which **auto-detects** the CI from its own
+environment variables and needs no wiring:
+
+| `--platform` | Behaviour |
+|--------------|-----------|
+| `auto` (default) | `gitlab` when `GITLAB_CI` is set, `github` when `GITHUB_ACTIONS` is set, else `plain` |
+| `gitlab` | GitLab `section_start`/`section_end` collapsible sections |
+| `github` | GitHub Actions `::group::` log groups |
+| `plain` | overview only, no section markers (the right choice for a local terminal) |
+
+The overview table prints on every platform, including locally. Only the
+section markers are platform-specific; pass `--platform plain` to force them
+off, or name a platform explicitly if auto-detection guesses wrong.
+
 ## Suppress a false positive
 
 Do **not** reach for `allow_failure: true` or `--no-verify`: those drop

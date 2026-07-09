@@ -323,6 +323,18 @@ def main():
         ),
     )
     advanced_group.add_argument(
+        "--platform",
+        choices=["auto", "plain", "gitlab", "github"],
+        default="auto",
+        help=(
+            "CI platform for log rendering. 'gitlab'/'github' wrap each "
+            "finding in a collapsible log section (folded by default) and "
+            "print a findings overview table above the details. 'plain' "
+            "emits neither. 'auto' (default) detects GITLAB_CI / "
+            "GITHUB_ACTIONS from the environment, falling back to plain."
+        ),
+    )
+    advanced_group.add_argument(
         "--monitor",
         action="store_true",
         help=(
@@ -463,6 +475,20 @@ def main():
     # Opt-in observations block. Default off so the standard hook flow
     # stays silent on success and findings never get diluted.
     runtime.set_show_observations(args.show_observations)
+
+    # CI platform for log rendering. "auto" sniffs the CI's own env vars
+    # (GITLAB_CI / GITHUB_ACTIONS) so the collapsible-section output turns
+    # on inside a pipeline without the user wiring a flag, and stays off
+    # (plain) in a local terminal where the section markers are noise.
+    platform = args.platform
+    if platform == "auto":
+        if os.environ.get("GITLAB_CI"):
+            platform = "gitlab"
+        elif os.environ.get("GITHUB_ACTIONS"):
+            platform = "github"
+        else:
+            platform = "plain"
+    runtime.set_platform(platform)
 
     # Monitor mode: dashboard over the configured monitor.repos[]. Opens
     # the TUI immediately on cached state; [r] inside the TUI refreshes.

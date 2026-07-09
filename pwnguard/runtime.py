@@ -34,6 +34,13 @@ debug_mode = False
 # silent on success and the findings list never gets diluted.
 show_observations = False
 
+# CI platform the report is rendered for: "plain", "gitlab", or "github".
+# "gitlab"/"github" wrap each finding in a collapsible log section and
+# print a findings overview table on top; "plain" emits neither. cli.main()
+# resolves --platform (auto-detecting GITLAB_CI / GITHUB_ACTIONS) once at
+# startup and calls set_platform().
+platform = "plain"
+
 
 def set_code_preview(enabled: bool) -> None:
     """Toggle whether the affected-lines block and fix_example block
@@ -61,3 +68,11 @@ def set_show_observations(enabled: bool) -> None:
     """Toggle the opt-in observations block. Resolved once in cli.main()."""
     global show_observations
     show_observations = enabled
+
+
+def set_platform(name: str) -> None:
+    """Set the CI platform for log rendering ("plain"/"gitlab"/"github").
+    cli.main() resolves --platform (and its auto-detect default) once
+    before rendering anything."""
+    global platform
+    platform = name

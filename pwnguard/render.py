@@ -8,7 +8,9 @@ emit raw ANSI; they call into ``ui.*`` from here.
 
 import contextlib
 import io
+import sys
 import textwrap
+import time
 from typing import Optional
 
 from pwnguard import runtime, ui
@@ -661,6 +663,90 @@ def _print_observations(observations: list) -> None:
                 print(f"{BODY_INDENT}{ui.dim(line)}")
 
 
+def _finding_header_plain(f: Finding) -> str:
+    """Single-line, ANSI-free header for a collapsible log section.
+
+    Shown as the fold title on GitLab/GitHub when the finding is
+    collapsed, so it has to read as a standalone summary: severity
+    letter, location, title, CWE. Kept free of escape codes because a
+    section-marker header is not a place we can rely on ANSI rendering
+    across both platforms.
+    """
+    letter = SEVERITY_LETTER.get(f.severity.upper(), "?")
+    bits = [f"[{letter}]"]
+    if f.file:
+        bits.append(f"{f.file}:{f.line}" if f.line else f.file)
+    bits.append(f.title)
+    if f.cwe:
+        bits.append(f.cwe)
+    return " ".join(bits)
+
+
+def _section_start(platform: str, sid: str, header: str) -> None:
+    """Open a collapsible log section on the active CI platform.
+
+    GitLab uses ``section_start`` markers wrapped in ``\\e[0K`` erase-line
+    codes plus a unix timestamp, and ``[collapsed=true]`` to fold by
+    default. GitHub uses ``::group::`` workflow commands, which fold by
+    default already. Any other platform ("plain") prints nothing so the
+    finding renders without a wrapper.
+    """
+    if platform == "gitlab":
+        ts = int(time.time())
+        sys.stdout.write(
+            f"\x1b[0Ksection_start:{ts}:{sid}[collapsed=true]\r\x1b[0K{header}\n"
+        )
+    elif platform == "github":
+        print(f"::group::{header}")
+
+
+def _section_end(platform: str, sid: str) -> None:
+    """Close the section opened by :func:`_section_start`."""
+    if platform == "gitlab":
+        ts = int(time.time())
+        sys.stdout.write(f"\x1b[0Ksection_end:{ts}:{sid}\r\x1b[0K\n")
+    elif platform == "github":
+        print("::endgroup::")
+
+
+def _print_overview(result: AuditResult) -> None:
+    """Compact one-row-per-finding index, severity-ordered, above the cards.
+
+    Gives CI logs (which scroll) a scannable table at the top so the full
+    finding list is visible before the detailed cards - and before the
+    per-finding sections, which fold shut on GitLab/GitHub. Skipped for a
+    single finding, where the card below is already the whole story.
+    """
+    findings = _ordered_findings(result)
+    if len(findings) < 2:
+        return
+    width = ui.term_width()
+    locs = []
+    for f in findings:
+        loc = ""
+        if f.file:
+            loc = f"{f.file}:{f.line}" if f.line else f.file
+        locs.append(loc)
+    loc_w = min(40, max((len(loc) for loc in locs), default=0))
+
+    print(ui.dim(f"Findings ({len(findings)})"))
+    for f, loc in zip(findings, locs):
+        badge = _severity_marker(f.severity)
+        loc_cell = ui.dim_cyan(loc.ljust(loc_w)) if loc_w else ""
+        cwe = _render_cwe(f)
+        cwe_w = ui.visible_len(cwe)
+        # Fixed left columns: 2 indent + 3 badge + 1 + loc_w + 2 gap.
+        used = 2 + 3 + 1 + loc_w + 2
+        title_budget = max(10, width - used - (cwe_w + 2 if cwe else 0))
+        title = _truncate_visible(ui.bold(f.title), title_budget)
+        line = f"  {badge} {loc_cell}  {title}"
+        if cwe:
+            pad = max(1, width - ui.visible_len(line) - cwe_w)
+            line = line + (" " * pad) + cwe
+        print(line)
+    print()
+
+
 def print_terminal(
     result: AuditResult,
     threshold: str,
@@ -697,6 +783,18 @@ def print_terminal(
     _print_legend()
     print()
 
+    # Findings index above the details. Skipped in --quiet, where the
+    # per-file title rows already are the compact list.
+    if not quiet:
+        _print_overview(result)
+
+    # On GitLab/GitHub, fold each detailed card into a collapsible log
+    # section so the overview stays the scannable entry point. Plain and
+    # --quiet get no section markers (they'd be noise in a terminal).
+    platform = runtime.platform
+    sectioned = platform in ("gitlab", "github") and not quiet
+    sec_i = 0
+
     # Both layouts group by file and share the title-row format.
     # --quiet collapses to that one row; default mode adds the code
     # snippet, description, and fix beneath.
@@ -708,7 +806,14 @@ def print_terminal(
             print()
         else:
             for f in findings:
-                _print_finding_block(f, diff_lines)
+                if sectioned:
+                    sid = f"pwnguard_{sec_i}"
+                    sec_i += 1
+                    _section_start(platform, sid, _finding_header_plain(f))
+                    _print_finding_block(f, diff_lines)
+                    _section_end(platform, sid)
+                else:
+                    _print_finding_block(f, diff_lines)
 
     _print_summary(result)
     _print_observations(result.observations)
