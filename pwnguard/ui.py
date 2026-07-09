@@ -113,6 +113,12 @@ SEVERITY_FG_ON_BG = {
 
 _use_color = True
 
+# Whether to emit OSC 8 hyperlinks (clickable CWE labels, file:// links).
+# Off for CI log viewers (GitLab/GitHub) that don't support OSC 8: there
+# the escape renders as visible URL text, breaking width math and pushing
+# metadata past the card border. cli.main() flips it per platform.
+_use_hyperlinks = True
+
 # Fallback terminal width used when neither stdout, COLUMNS, nor /dev/tty
 # yields a size - i.e. a CI job with no PTY. cli.main() bumps this for CI
 # platforms whose log panes are far wider than the 80-column default.
@@ -123,6 +129,13 @@ def configure(*, color: bool = True) -> None:
     """Configure UI globals. Call once near startup, after parsing args."""
     global _use_color
     _use_color = color
+
+
+def set_hyperlinks(enabled: bool) -> None:
+    """Toggle OSC 8 hyperlink emission. cli.main() turns this off for CI
+    platforms whose log viewers render the escape as literal URL text."""
+    global _use_hyperlinks
+    _use_hyperlinks = enabled
 
 
 def set_default_width(cols: int) -> None:
@@ -256,7 +269,7 @@ def hyperlink(text: str, url: str) -> str:
     Older terminals just show ``text`` and discard the escape, so we
     don't pollute output with a long URL alongside the label.
     """
-    if not _use_color:
+    if not _use_color or not _use_hyperlinks:
         return text
     return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
 

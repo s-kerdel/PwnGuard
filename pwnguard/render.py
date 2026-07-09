@@ -173,7 +173,9 @@ def _print_legend() -> None:
         parts.append(f"{_severity_marker(sev)} {ui.dim(sev.lower())}")
     if runtime.show_observations:
         parts.append(f"{_severity_marker('OBSERVATION')} {ui.dim('observation')}")
-    print("  " + "  ".join(parts))
+    # Flush-left: the legend is a top-level key, aligned with the scan
+    # header and the finding rows; only the finding content is indented.
+    print("  ".join(parts))
 
 
 def _build_metadata(f: Finding) -> str:
@@ -795,7 +797,11 @@ def print_terminal(
         # the collapsed headers are the list.
         for i, f in enumerate(_ordered_findings(result)):
             sid = f"pwnguard_{i}"
-            _section_start(platform, sid, _section_header(f))
+            # Indent the finding title to the card's 2-space margin so its
+            # left edge lines up with the card box below. The severity badge
+            # carries one leading space, so a single-space prefix lands the
+            # title at column 2. Only the legend and scan header sit flush-left.
+            _section_start(platform, sid, " " + _section_header(f))
             _print_finding_block(f, diff_lines)
             _section_end(platform, sid)
     else:

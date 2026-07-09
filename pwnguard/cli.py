@@ -493,8 +493,11 @@ def main():
     # CI log panes are far wider than the 80-column fallback used when
     # stdout is a pipe with no detectable terminal size. Widen the default
     # for GitLab/GitHub; COLUMNS (or a real terminal) still overrides.
+    # Their log viewers also can't render OSC 8, so drop hyperlinks - the
+    # escape would show as literal URL text and overrun the card border.
     if platform in ("gitlab", "github"):
         ui.set_default_width(120)
+        ui.set_hyperlinks(False)
 
     # Monitor mode: dashboard over the configured monitor.repos[]. Opens
     # the TUI immediately on cached state; [r] inside the TUI refreshes.

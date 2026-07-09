@@ -212,3 +212,32 @@ def test_default_width_used_when_size_undetectable(monkeypatch):
         assert ui.term_width() == 120
     finally:
         ui._default_width = saved
+
+
+# ---------------------------------------------------------------------------
+# OSC 8 hyperlinks off in CI (viewers show them as literal URL text)
+# ---------------------------------------------------------------------------
+
+def test_hyperlinks_can_be_disabled():
+    saved_color, saved_links = ui._use_color, ui._use_hyperlinks
+    try:
+        ui.configure(color=True)
+        ui.set_hyperlinks(False)
+        # No OSC 8 wrapper: plain visible text, correct width.
+        assert ui.hyperlink("CWE-78", "https://x") == "CWE-78"
+        assert "\x1b]8;;" not in ui.file_link("shell.php", 4)
+        ui.set_hyperlinks(True)
+        assert "\x1b]8;;" in ui.hyperlink("CWE-78", "https://x")
+    finally:
+        ui._use_color, ui._use_hyperlinks = saved_color, saved_links
+
+
+def test_ci_card_has_no_osc8_escapes(three_findings, diff_lines, restore_platform):
+    saved_color, saved_links = ui._use_color, ui._use_hyperlinks
+    try:
+        ui.configure(color=True)
+        ui.set_hyperlinks(False)
+        out = _render(_result(three_findings), diff_lines, "gitlab")
+        assert "\x1b]8;;" not in out
+    finally:
+        ui._use_color, ui._use_hyperlinks = saved_color, saved_links

@@ -103,7 +103,8 @@ cards instead.
 Inside GitLab/GitHub, PwnGuard forces ANSI color on (their logs render
 it even though stdout is a pipe) and widens the report to 120 columns.
 Set `COLUMNS` in the job to use a different width; `NO_COLOR=1` or
-`--no-color` turns color off.
+`--no-color` turns color off. CWE and file links render as plain styled
+text there, since those log viewers don't support terminal hyperlinks.
 
 This is driven by `--platform`, which **auto-detects** the CI from its own
 environment variables and needs no wiring:
