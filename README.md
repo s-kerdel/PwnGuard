@@ -394,6 +394,7 @@ Every config key, its default, and what it controls. PwnGuard looks for
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `timeout` | `120` | Wall-clock seconds for one `claude` invocation. |
+| `prefer_api_key` | `false` | By default PwnGuard strips `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the `claude` subprocess so scans run on your Claude subscription, not per-token API billing (Claude Code otherwise prefers those vars silently in headless mode). Set `true` to forward them and bill the API instead. |
 
 ### `claude_api:` (uses the Anthropic API)
 
