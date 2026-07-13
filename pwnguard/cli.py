@@ -179,7 +179,7 @@ def main():
     )
     backend_group.add_argument(
         "--model",
-        help="Override model (e.g. qwen2.5-coder:14b, claude-opus-4-7, claude-sonnet-4-6)",
+        help="Override model (e.g. qwen2.5-coder:14b, claude-sonnet-5, claude-opus-4-8)",
     )
 
     output_group = parser.add_argument_group("Output")

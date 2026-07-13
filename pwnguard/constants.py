@@ -60,9 +60,9 @@ MONITOR_STATE_VERSION = 2
 DEFAULT_CONFIG = {
     "severity_threshold": "HIGH",
     "claude_api": {
-        # Default to the latest Opus at the time of writing. Override in
-        # pwnguard.yaml when a newer/cheaper model becomes appropriate.
-        "model": "claude-opus-4-7",
+        # Default to Sonnet (good quality at lower cost). Override in
+        # pwnguard.yaml, e.g. model: claude-opus-4-8 for a stronger model.
+        "model": "claude-sonnet-5",
         "max_tokens": 4096,
     },
     "claude_code": {

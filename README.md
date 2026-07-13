@@ -324,7 +324,7 @@ Every flag accepted by `pwnguard`. Default values come from
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--backend {claude-code,ollama,claude-api,openai-compat}` | auto-detected | Which AI backend to use. Auto-detection picks claude-code if the `claude` CLI is present, otherwise ollama. `openai-compat` is opt-in. |
-| `--model <NAME>` | from config | Override the model for the active backend (e.g. `qwen2.5-coder:14b`, `claude-opus-4-7`, `claude-sonnet-4-6`). |
+| `--model <NAME>` | from config | Override the model for the active backend (e.g. `qwen2.5-coder:14b`, `claude-sonnet-5`, `claude-opus-4-8`). |
 | `--config <PATH>` | `pwnguard.yaml` in cwd | Use a different config file. |
 
 ### Output + presentation
@@ -399,7 +399,7 @@ Every config key, its default, and what it controls. PwnGuard looks for
 
 | Key | Default | Purpose |
 |-----|---------|---------|
-| `model` | `claude-opus-4-7` | Model to call. Pick from Anthropic's available IDs. |
+| `model` | `claude-sonnet-5` | Model to call. Pick from Anthropic's available IDs (e.g. `claude-opus-4-8` for a stronger, pricier model). |
 | `max_tokens` | `4096` | Output budget per response. |
 
 ### `ollama:` (uses a local Ollama server)

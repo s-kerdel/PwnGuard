@@ -91,7 +91,7 @@ def query_ollama(diff: str, config: dict, system_prompt: str = SYSTEM_PROMPT) ->
         if runtime.debug_mode:
             return _query_ollama_stream(req, timeout, url)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
+            raw_body = resp.read()
     except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
         msg = str(e)
         if "timed out" in msg.lower():
@@ -103,6 +103,17 @@ def query_ollama(diff: str, config: dict, system_prompt: str = SYSTEM_PROMPT) ->
         sys.exit(
             f"Error: cannot reach Ollama at {url}: {e}\n"
             f"Is Ollama running (ollama serve)?"
+        )
+
+    # A 200 with a non-JSON body (misconfigured proxy, HTML error page, empty
+    # body) would otherwise crash on json.loads mid-pipeline.
+    try:
+        data = json.loads(raw_body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        snippet = _sanitize(raw_body[:300].decode("utf-8", errors="replace")) or "(empty)"
+        sys.exit(
+            f"Error: Ollama at {url} returned a non-JSON response "
+            f"({e.__class__.__name__}). First bytes: {snippet!r}"
         )
 
     # Ollama returns {"message": {"content": ...}} on success, but error

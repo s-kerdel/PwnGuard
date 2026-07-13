@@ -214,14 +214,23 @@ def query_openai_compat(diff: str, config: dict, system_prompt: str = SYSTEM_PRO
         err = data.get("error") if isinstance(data, dict) else None
         snippet = _sanitize(str(err or data)[:300]) or "(empty)"
         sys.exit(f"Error: unexpected OpenAI-compatible response: {snippet}")
-    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message", {}) if isinstance(first, dict) else {}
     content = message.get("content")
-    if not content:
-        # Empty content is what OpenAI returns on safety-stop refusals
-        # or some proxies' rate-limit/quota responses. Treat as no findings
-        # rather than crashing the whole scan.
-        return '{"findings": []}'
-    return content
+    if content:
+        return content
+
+    # Empty content (safety-stop refusals, truncation, quota responses) is not
+    # a clean scan: returning empty findings would read as "no vulnerabilities
+    # found". Abort with the finish_reason so the failure is surfaced.
+    reason = first.get("finish_reason")
+    if reason == "length":
+        detail = "response truncated at max_tokens (raise openai.num_predict)"
+    elif reason == "content_filter":
+        detail = "response blocked by the provider content filter"
+    else:
+        detail = f"model returned no content (finish_reason={reason!r})"
+    sys.exit(f"Error: openai-compat scan produced no result - {detail}.")
 
 
 def _query_openai_compat_stream(req: urllib.request.Request, timeout: int, base_url: str) -> str:
