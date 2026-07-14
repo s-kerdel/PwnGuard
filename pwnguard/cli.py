@@ -117,12 +117,26 @@ _BACKEND_MODEL_BLOCK = {
 def _ci_run_banner(backend: str, config: dict) -> str:
     """One-line ``PwnGuard vX  ·  backend  ·  model`` banner for CI logs, so
     the pipeline output states which version and model ran (whether it's
-    current, and what review quality to expect)."""
+    current, and what review quality to expect).
+
+    Thinking is appended as a trailing ``·  thinking: <mode>`` segment when
+    it's on, since it changes review quality too. Off is the default and
+    stays unprinted, so the common banner keeps its shape.
+    """
     block = _BACKEND_MODEL_BLOCK.get(backend)
-    model = config.get(block, {}).get("model") if block else None
+    block_cfg = config.get(block, {}) if block else {}
     head = f"{ui.bold('PwnGuard')} {ui.dim('v' + __version__)}"
-    sep = f"  {ui.dim('·')}  "
-    return f"{head}{sep}{backend}{sep}{model}" if model else f"{head}{sep}{backend}"
+
+    parts = [head, backend]
+    if model := block_cfg.get("model"):
+        parts.append(model)
+    # Only claude_api carries a thinking key, so this stays empty for the
+    # other backends without special-casing them.
+    thinking = block_cfg.get("thinking")
+    if thinking and thinking != "disabled":
+        parts.append(f"thinking: {thinking}")
+
+    return f"  {ui.dim('·')}  ".join(parts)
 
 
 def main():

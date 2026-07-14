@@ -1,6 +1,6 @@
 # PwnGuard
 
-> **Status: Proof of Concept (`v0.2.7`).**
+> **Status: Proof of Concept (`v0.2.8`).**
 > PwnGuard is an open-source security tool by Shiva Kerdel (Power to Logic).
 > It flags risky code when committing your work, so issues surface during
 > development instead of in production. Proof of concept: flags and config
@@ -401,7 +401,8 @@ Every config key, its default, and what it controls. PwnGuard looks for
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `model` | `claude-sonnet-5` | Model to call. Pick from Anthropic's available IDs (e.g. `claude-opus-4-8` for a stronger, pricier model). |
-| `max_tokens` | `4096` | Output budget per response. |
+| `max_tokens` | `8192` | Output budget per response, enough for roughly 50 findings. Raise it when `thinking` is on, since reasoning is billed against the same budget. Values above `8192` fail on Opus 4 / 4.1 and above `21333` fail on any model, because the SDK requires streaming for responses it estimates will take over 10 minutes. |
+| `thinking` | `disabled` | Extended thinking mode, sent as `thinking.type`. `disabled` on every model except `claude-fable-5`, which always thinks; `adaptive` on 4.6 and newer (the model picks its own depth); `enabled` on 4.5 and older, where the thinking budget is derived as half of `max_tokens`. |
 
 ### `ollama:` (uses a local Ollama server)
 

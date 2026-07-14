@@ -62,17 +62,21 @@ def query_claude_api(diff: str, config: dict, system_prompt: str = SYSTEM_PROMPT
     user_content = f"Review this git diff for security vulnerabilities:\n\n{diff}"
     maybe_confirm_large_prompt(system_prompt + user_content, backend="claude-api")
 
-    # TODO: parameterize thinking and max_tokens via claude_api config.
-    # Adaptive thinking works on current models (4.6+) and improves recall,
-    # but needs a larger max_tokens so the reasoning does not crowd out the
-    # findings JSON.
+    max_tokens = claude_config.get("max_tokens", 8192)
+
+    # Passed straight through; the API rejects a type the model does not
+    # support. See DEFAULT_CONFIG in constants.py for the valid values.
+    thinking = {"type": claude_config.get("thinking", "disabled")}
+    if thinking["type"] == "enabled":
+        # Legacy models only. budget_tokens must be strictly below
+        # max_tokens (and at least 1024), so split the budget in half.
+        thinking["budget_tokens"] = max_tokens // 2
+
     try:
         message = client.messages.create(
             model=claude_config.get("model", "claude-sonnet-5"),
-            max_tokens=claude_config.get("max_tokens", 4096),
-            # Thinking off; some models (e.g. claude-sonnet-5) run adaptive
-            # thinking by default when omitted and prepend a ThinkingBlock.
-            thinking={"type": "disabled"},
+            max_tokens=max_tokens,
+            thinking=thinking,
             system=system_prompt,
             messages=[{"role": "user", "content": user_content}],
         )

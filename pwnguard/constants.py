@@ -63,7 +63,20 @@ DEFAULT_CONFIG = {
         # Default to Sonnet (good quality at lower cost). Override in
         # pwnguard.yaml, e.g. model: claude-opus-4-8 for a stronger model.
         "model": "claude-sonnet-5",
-        "max_tokens": 4096,
+        # Output budget per response; fits ~50 findings, fewer with thinking on.
+        "max_tokens": 8192,
+        # Passed through as thinking.type. Off by default because some
+        # models (e.g. claude-sonnet-5) think when it is omitted. Valid
+        # values depend on the model:
+        #   disabled: every model except fable-5, which always thinks and
+        #             rejects an explicit disable
+        #   adaptive: 4.6 and newer (sonnet-5, opus-4-7/4-8, fable-5); the
+        #             model picks its own thinking depth
+        #   enabled:  opus/sonnet 4.5 and older; budget_tokens is derived
+        #             from max_tokens (see backends/claude_api.py)
+        # Thinking output counts against max_tokens, so raise max_tokens when
+        # switching this on or the reasoning crowds out the findings JSON.
+        "thinking": "disabled",
     },
     "claude_code": {
         "timeout": 120,

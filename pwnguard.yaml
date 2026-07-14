@@ -21,7 +21,8 @@ claude_code:
 # Only needed if your org has API access
 claude_api:
   model: claude-sonnet-5
-  max_tokens: 4096
+  max_tokens: 8192  # output budget; raise when thinking is on
+  thinking: disabled  # disabled, adaptive (4.6+), enabled (4.5 and older)
 
 # Ollama settings (local LLM, free, offline)
 # Default backend for CI (self-hosted runner)

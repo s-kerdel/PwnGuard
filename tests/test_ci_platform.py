@@ -225,6 +225,32 @@ def test_ci_banner_reads_configured_model():
     assert "qwen2.5-coder:14b" in b
 
 
+def test_ci_banner_omits_thinking_when_disabled():
+    """The default must keep the banner's original shape."""
+    cfg = {"claude_api": {"model": "claude-sonnet-5", "thinking": "disabled"}}
+    b = _strip(_ci_run_banner("claude-api", cfg))
+    assert "thinking" not in b
+    assert b.count("·") == 2   # version · backend · model
+
+
+def test_ci_banner_shows_thinking_after_the_model():
+    cfg = {"claude_api": {"model": "claude-sonnet-5", "thinking": "adaptive"}}
+    b = _strip(_ci_run_banner("claude-api", cfg))
+    assert "thinking: adaptive" in b
+    assert b.index("claude-sonnet-5") < b.index("thinking: adaptive")
+
+
+def test_ci_banner_shows_legacy_enabled_thinking():
+    cfg = {"claude_api": {"model": "claude-opus-4-1", "thinking": "enabled"}}
+    assert "thinking: enabled" in _strip(_ci_run_banner("claude-api", cfg))
+
+
+def test_ci_banner_has_no_thinking_segment_for_other_backends():
+    """Only claude_api carries the key; ollama must not grow a segment."""
+    b = _strip(_ci_run_banner("ollama", {"ollama": {"model": "qwen2.5-coder:7b"}}))
+    assert "thinking" not in b
+
+
 # ---------------------------------------------------------------------------
 # Footer: CI drops the hook bypass hint; --report-only reads as advisory
 # ---------------------------------------------------------------------------
